@@ -1,24 +1,33 @@
+import sys
+import os
 import multiprocessing as mp
 import time
+from sklearn.datasets import fetch_california_housing
 from ml_worker import train_housing_model
 
 if __name__ == '__main__':
-    # Force 'spawn' for safe memory initialization on both Windows and Linux
+    venv_python = sys.executable
+    mp.set_executable(venv_python)
     mp.set_start_method('spawn', force=True)
 
     print("===============================================================")
-    print("Starting Concurrent Intel iGPU Model Training")
-    print("Open Windows Task Manager (Performance -> GPU) or Linux 'intel_gpu_top'")
+    print(f"Using Interpreter: {venv_python}")
+    print("Pre-fetching dataset to prevent file locking conflicts...")
+    housing = fetch_california_housing()
+    X, y = housing.data, housing.target
+    print("Dataset loaded successfully.")
     print("===============================================================\n")
 
-    # Define tasks to pass to workers
-    tasks = [1, 2]
+    tasks = [
+        (X, y, 1),
+        (X, y, 2)
+    ]
 
+    print("Starting Concurrent Intel iGPU Model Training...")
     start_all = time.time()
 
-    # Keep pool size low (e.g. 2 processes) because iGPUs share system memory channels
     with mp.Pool(processes=2) as pool:
-        results = pool.map(train_housing_model, tasks)
+        results = pool.starmap(train_housing_model, tasks)
 
     end_all = time.time()
 

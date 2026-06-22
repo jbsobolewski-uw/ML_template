@@ -1,4 +1,4 @@
-scikit-learn-intelex>=2024.0.0
-dpctl>=0.14.0
-scikit-learn>=1.2.0
-numpy>=1.22.0
+scikit-learn-intelex-gpu
+dpct
+scikit-learn
+numpy
