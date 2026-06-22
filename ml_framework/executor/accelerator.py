@@ -1,13 +1,18 @@
 """
 executor/accelerator.py
---------------
+-----------------------
 Hardware detection and compute backend selection.
 
 Priority logic:
-  - Large workloads (> LARGE_WORKLOAD_THRESHOLD samples): CPU-only.
+  - Large workloads (> LARGE_WORKLOAD_THRESHOLD elements): CPU-only (iGPU bypassed).
   - NVIDIA GPU present + torch available: CUDA.
   - Intel GPU present + sklearnex available: iGPU (small/medium workloads only).
   - Fallback: CPU.
+
+force_backend behaviour:
+  - If the forced backend is *unavailable* on this hardware, raises BackendUnavailableError.
+    The caller (worker.py) catches this and returns a failed WorkerResult.
+  - Silent fallback on force failure is intentionally NOT supported: it masks misconfiguration.
 """
 
 import os
@@ -29,6 +34,13 @@ class Backend(Enum):
     NVIDIA_GPU = auto()
 
 
+class BackendUnavailableError(RuntimeError):
+    """
+    Raised when a forced backend cannot be satisfied by available hardware.
+    Prefer this over silent fallback so misconfiguration is never hidden.
+    """
+
+
 @dataclass
 class HardwareProfile:
     backend: Backend
@@ -40,13 +52,16 @@ class HardwareProfile:
     extra: dict = field(default_factory=dict)
 
 
+# ---------------------------------------------------------------------------
+# Detection helpers
+# ---------------------------------------------------------------------------
+
 def _detect_nvidia() -> tuple[bool, str]:
     """Return (available, device_name) for NVIDIA CUDA."""
     try:
-        import torch  # noqa: F401
+        import torch
         if torch.cuda.is_available():
-            name = torch.cuda.get_device_name(0)
-            return True, name
+            return True, torch.cuda.get_device_name(0)
     except ImportError:
         pass
     return False, ""
@@ -54,8 +69,8 @@ def _detect_nvidia() -> tuple[bool, str]:
 
 def _detect_intel_gpu() -> tuple[bool, str]:
     """
-    Return (available, device_name) for Intel GPU via dpctl or sklearnex.
-    Works on both Linux and Windows.
+    Return (available, device_name) for Intel GPU.
+    Tries dpctl first (most reliable), then a sklearnex probe fit as fallback.
     """
     try:
         import dpctl
@@ -66,17 +81,15 @@ def _detect_intel_gpu() -> tuple[bool, str]:
     except (ImportError, Exception):
         pass
 
-    # Fallback: try sklearnex GPU context probe.
     try:
-        from sklearnex import config_context
+        from sklearnex import config_context, patch_sklearn
         from sklearn.datasets import make_regression
         from sklearn.linear_model import LinearRegression
-        from sklearnex import patch_sklearn
+
         patch_sklearn()
         X_tiny, y_tiny = make_regression(n_samples=10, n_features=2, random_state=0)
         with config_context(target_offload="gpu:0"):
-            m = LinearRegression()
-            m.fit(X_tiny, y_tiny)
+            LinearRegression().fit(X_tiny, y_tiny)
         return True, "Intel GPU (sklearnex probe)"
     except Exception:
         pass
@@ -100,6 +113,10 @@ def _torch_available() -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 def detect_hardware() -> HardwareProfile:
     """
     Probe available accelerators and return a HardwareProfile.
@@ -110,7 +127,7 @@ def detect_hardware() -> HardwareProfile:
     sklex_ok = _sklearnex_available()
     torch_ok = _torch_available()
 
-    profile = HardwareProfile(
+    return HardwareProfile(
         backend=Backend.CPU,
         device_name="CPU",
         cuda_available=cuda_ok,
@@ -124,7 +141,6 @@ def detect_hardware() -> HardwareProfile:
             "cpu_count": os.cpu_count(),
         },
     )
-    return profile
 
 
 def select_backend(
@@ -132,6 +148,7 @@ def select_backend(
     n_samples: int = 0,
     n_features: int = 0,
     force_backend: Optional[Backend] = None,
+    large_workload_threshold: Optional[int] = None,
 ) -> Backend:
     """
     Choose compute backend given hardware profile and workload size.
@@ -142,63 +159,91 @@ def select_backend(
     n_samples : int
     n_features : int
     force_backend : Backend or None
-        Bypass auto-selection.
+        Bypass auto-selection. Raises BackendUnavailableError if the requested
+        backend cannot be satisfied — never silently falls back.
+    large_workload_threshold : int or None
+        Override module-level LARGE_WORKLOAD_THRESHOLD for this call.
 
     Returns
     -------
     Backend
+
+    Raises
+    ------
+    BackendUnavailableError
+        If force_backend is set but the required hardware/libraries are absent.
     """
+    threshold = large_workload_threshold if large_workload_threshold is not None \
+        else LARGE_WORKLOAD_THRESHOLD
+
     if force_backend is not None:
-        # Sanitize forced NVIDIA requests against environment capabilities
-        if force_backend == Backend.NVIDIA_GPU and not (
-                profile.cuda_available and profile.torch_available
-        ):
-            logger.warning(
-                "Backend forced to NVIDIA_GPU, but CUDA is unavailable "
-                "on this hardware. Falling back to automatic backend choice."
-            )
-
-        # Sanitize forced Intel requests against environment capabilities
-        elif force_backend == Backend.INTEL_GPU and not (
-                profile.intel_gpu_available and profile.sklearnex_available
-        ):
-            logger.warning(
-                "Backend forced to INTEL_GPU, but Intel extensions "
-                "are unavailable on this hardware. Falling back to "
-                "automatic backend choice."
-            )
-
-        else:
-            logger.info("Backend successfully forced to: %s", force_backend)
-            return force_backend
+        _validate_forced_backend(force_backend, profile)
+        logger.info("Backend forced to: %s", force_backend.name)
+        return force_backend
 
     workload_size = n_samples * n_features
 
-    # NVIDIA GPU — highest priority for neural nets / large models.
     if profile.cuda_available and profile.torch_available:
         logger.info("Backend selected: NVIDIA_GPU (%s)", profile.extra["cuda_device"])
         return Backend.NVIDIA_GPU
 
-    # Intel iGPU — only for small/medium classical ML workloads.
     if (
         profile.intel_gpu_available
         and profile.sklearnex_available
-        and workload_size < LARGE_WORKLOAD_THRESHOLD
+        and workload_size < threshold
     ):
         logger.info(
-            "Backend selected: INTEL_GPU (%s), workload=%d",
+            "Backend selected: INTEL_GPU (%s) | workload=%d",
             profile.extra["intel_gpu_device"],
             workload_size,
         )
         return Backend.INTEL_GPU
 
-    if profile.intel_gpu_available and workload_size >= LARGE_WORKLOAD_THRESHOLD:
+    if profile.intel_gpu_available and workload_size >= threshold:
         logger.info(
             "Workload (%d elements) exceeds threshold (%d). "
             "Bypassing iGPU, using CPU.",
             workload_size,
-            LARGE_WORKLOAD_THRESHOLD,
+            threshold,
         )
 
     logger.info("Backend selected: CPU")
     return Backend.CPU
+
+
+def _validate_forced_backend(backend: Backend, profile: HardwareProfile) -> None:
+    """
+    Raise BackendUnavailableError if the requested backend cannot be used.
+
+    Parameters
+    ----------
+    backend : Backend
+    profile : HardwareProfile
+
+    Raises
+    ------
+    BackendUnavailableError
+    """
+    if backend == Backend.NVIDIA_GPU:
+        missing = []
+        if not profile.torch_available:
+            missing.append("torch not installed")
+        if not profile.cuda_available:
+            missing.append("CUDA unavailable (no NVIDIA GPU or driver missing)")
+        if missing:
+            raise BackendUnavailableError(
+                f"Backend.NVIDIA_GPU requested but cannot be satisfied: "
+                f"{'; '.join(missing)}."
+            )
+
+    elif backend == Backend.INTEL_GPU:
+        missing = []
+        if not profile.intel_gpu_available:
+            missing.append("no Intel GPU detected")
+        if not profile.sklearnex_available:
+            missing.append("scikit-learn-intelex not installed")
+        if missing:
+            raise BackendUnavailableError(
+                f"Backend.INTEL_GPU requested but cannot be satisfied: "
+                f"{'; '.join(missing)}."
+            )

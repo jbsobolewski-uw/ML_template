@@ -29,7 +29,7 @@ from typing import Any
 import numpy as np
 from sklearn.base import BaseEstimator
 
-from src.executor.accelerator import Backend
+from ml_framework.executor.accelerator import Backend
 
 logger = logging.getLogger(__name__)
 

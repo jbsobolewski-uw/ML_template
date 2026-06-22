@@ -8,9 +8,10 @@ Device priority:
   INTEL_GPU  -> 'xpu' (Intel Extension for PyTorch) or 'cpu' fallback
   CPU        -> 'cpu'
 
-The module ships a generic MLP (MLPRegressor / MLPClassifier) usable
-as a drop-in for most tabular deep learning tasks.
-For custom architectures, pass any nn.Module to train_neural().
+resolve_torch_device() raises DeviceUnavailableError when an explicitly
+requested accelerator cannot be satisfied, rather than silently falling
+back to CPU. Silent fallback masks misconfiguration and makes profiling
+results misleading.
 
 Dependencies
 ------------
@@ -23,9 +24,17 @@ import logging
 from typing import Callable, Optional
 
 import numpy as np
-from src.executor.accelerator import Backend
+from ml_framework.executor.accelerator import Backend
 
 logger = logging.getLogger(__name__)
+
+
+class DeviceUnavailableError(RuntimeError):
+    """
+    Raised when the torch device required by a Backend cannot be acquired.
+    Distinct from BackendUnavailableError (accelerator-layer) so callers
+    can distinguish detection-time vs. runtime failures.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +44,7 @@ logger = logging.getLogger(__name__)
 def resolve_torch_device(
     backend: Backend,
     explicit_device: Optional[str] = None,
+    strict: bool = True,
 ) -> "torch.device":
     """
     Map a Backend enum to a torch.device.
@@ -43,19 +53,40 @@ def resolve_torch_device(
     ----------
     backend : Backend
     explicit_device : str or None
-        If set, bypasses auto-resolution (e.g. 'cuda:1', 'cpu').
+        If set, returns torch.device(explicit_device) directly without
+        any availability check. Caller assumes full responsibility.
+    strict : bool
+        If True (default), raises DeviceUnavailableError when the backend
+        device cannot be acquired. If False, silently falls back to CPU.
+        Use strict=False only in testing or exploratory contexts.
 
     Returns
     -------
     torch.device
+
+    Raises
+    ------
+    DeviceUnavailableError
+        When strict=True and the requested backend device is unavailable.
     """
     import torch
 
     if explicit_device is not None:
         return torch.device(explicit_device)
 
-    if backend == Backend.NVIDIA_GPU and torch.cuda.is_available():
-        return torch.device("cuda")
+    if backend == Backend.NVIDIA_GPU:
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        msg = (
+            "Backend.NVIDIA_GPU was selected but torch.cuda.is_available() "
+            "returned False at training time. This indicates a mismatch between "
+            "hardware detection (accelerator.py) and the runtime CUDA context. "
+            "Check driver initialisation order and CUDA_VISIBLE_DEVICES."
+        )
+        if strict:
+            raise DeviceUnavailableError(msg)
+        logger.warning("%s Falling back to CPU.", msg)
+        return torch.device("cpu")
 
     if backend == Backend.INTEL_GPU:
         try:
@@ -63,10 +94,15 @@ def resolve_torch_device(
             if hasattr(torch, "xpu") and torch.xpu.is_available():
                 return torch.device("xpu")
         except ImportError:
-            logger.warning(
-                "intel_extension_for_pytorch not installed. "
-                "Intel GPU backend unavailable for PyTorch; using CPU."
-            )
+            pass
+        # Intel XPU not available: this is a soft fallback (ipex is optional).
+        logger.warning(
+            "Backend.INTEL_GPU requested for PyTorch but XPU is unavailable "
+            "(intel_extension_for_pytorch missing or no XPU device). "
+            "Falling back to CPU for this neural task. "
+            "sklearn tasks will still use sklearnex iGPU offload."
+        )
+        return torch.device("cpu")
 
     return torch.device("cpu")
 
@@ -82,7 +118,7 @@ def _build_mlp(
     task: str = "regression",
 ) -> "torch.nn.Module":
     """
-    Build a fully-connected MLP.
+    Build a fully-connected MLP with BatchNorm and ReLU activations.
 
     Parameters
     ----------
@@ -109,7 +145,7 @@ def _build_mlp(
 
     if task == "classification" and output_dim == 1:
         layers.append(nn.Sigmoid())
-    # Multi-class softmax is applied via CrossEntropyLoss; no explicit layer needed.
+    # Multi-class: softmax applied implicitly via CrossEntropyLoss.
 
     return nn.Sequential(*layers)
 
@@ -137,34 +173,42 @@ def train_neural(
     Parameters
     ----------
     model : nn.Module
-        Uninitialized or pre-built PyTorch model.
+        Unfitted PyTorch model instance.
     X : np.ndarray, shape (n_samples, n_features)
     y : np.ndarray, shape (n_samples,) or (n_samples, n_outputs)
     backend : Backend
     explicit_device : str or None
+        Passed directly to resolve_torch_device; bypasses all checks.
     task : str
-        'regression' or 'classification'. Determines default loss.
+        'regression' or 'classification'. Determines default loss function.
     epochs : int
     batch_size : int
     lr : float
         Learning rate for Adam.
     loss_fn : callable or None
-        Custom loss. If None, MSELoss (regression) or CrossEntropyLoss.
+        Custom loss. Defaults to MSELoss (regression) or CrossEntropyLoss.
     callbacks : list of callable or None
-        Each callback receives (epoch, loss_value) after every epoch.
+        Each callback receives (epoch: int, avg_loss: float).
 
     Returns
     -------
-    dict with keys: 'model', 'device', 'history', 'duration_s'
+    dict
+        Keys: 'model' (moved to CPU), 'device' (str), 'history' (list[float]),
+        'duration_s' (float), 'backend_used' (str).
+
+    Raises
+    ------
+    DeviceUnavailableError
+        If backend=NVIDIA_GPU but CUDA is not available at runtime.
     """
     import torch
     import torch.nn as nn
     from torch.utils.data import TensorDataset, DataLoader
 
-    device = resolve_torch_device(backend, explicit_device)
+    # strict=True: fail loudly if the selected backend cannot be honoured.
+    device = resolve_torch_device(backend, explicit_device, strict=True)
     logger.info("Neural training on device: %s", str(device).upper())
 
-    # Cast data.
     X_t = torch.tensor(X, dtype=torch.float32)
     if task == "classification":
         y_t = torch.tensor(y, dtype=torch.long)
@@ -178,7 +222,7 @@ def train_neural(
 
     model = model.to(device)
 
-    # Intel XPU optimisation (optional).
+    # Intel XPU: apply ipex optimisation pass when available.
     if str(device) == "xpu":
         try:
             import intel_extension_for_pytorch as ipex
@@ -221,16 +265,26 @@ def train_neural(
     duration = time.perf_counter() - start
     logger.info(
         "Neural training complete | device=%s | epochs=%d | duration=%.2fs",
-        device,
+        str(device).upper(),
         epochs,
         duration,
     )
+
+    # Resolve backend_used string from actual device, not from the Backend enum.
+    actual = str(device).lower()
+    if "cuda" in actual:
+        backend_used = Backend.NVIDIA_GPU.name
+    elif "xpu" in actual:
+        backend_used = Backend.INTEL_GPU.name
+    else:
+        backend_used = Backend.CPU.name
 
     return {
         "model": model.cpu(),
         "device": str(device),
         "history": history,
         "duration_s": round(duration, 4),
+        "backend_used": backend_used,
     }
 
 
@@ -243,7 +297,7 @@ def build_mlp_regressor(
     output_dim: int = 1,
     hidden_dims: tuple[int, ...] = (256, 128, 64),
 ) -> "torch.nn.Module":
-    """Construct a MLP suitable for regression."""
+    """Construct an MLP suitable for regression."""
     return _build_mlp(input_dim, output_dim, hidden_dims, task="regression")
 
 
@@ -252,5 +306,5 @@ def build_mlp_classifier(
     n_classes: int,
     hidden_dims: tuple[int, ...] = (256, 128, 64),
 ) -> "torch.nn.Module":
-    """Construct a MLP suitable for classification."""
+    """Construct an MLP suitable for classification."""
     return _build_mlp(input_dim, n_classes, hidden_dims, task="classification")

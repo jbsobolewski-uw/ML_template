@@ -1,15 +1,18 @@
 """
 executor/worker.py
----------
+------------------
 Worker function executed in each child process spawned by pool.py.
 
 Design constraints
 ------------------
-- Must be importable on Windows (spawn method requires top-level picklability).
-- No module-level side effects (no patch_sklearn() at import time).
-- Receives a WorkerTask dataclass; returns a WorkerResult dataclass.
-- Backend selection is re-confirmed inside the worker because child processes
-  inherit no state from the parent under 'spawn'.
+- Must be importable on Windows (spawn requires top-level picklability).
+- No module-level side effects.
+- Receives WorkerTask; returns WorkerResult.
+- Backend selection re-runs inside the worker: child processes under 'spawn'
+  inherit no runtime state from the parent.
+- BackendUnavailableError from accelerator and DeviceUnavailableError from
+  neural.py are both caught and surfaced as a failed WorkerResult, not a
+  pool-level crash, so remaining tasks continue unaffected.
 """
 
 import os
@@ -21,15 +24,15 @@ from typing import Any, Optional
 
 import numpy as np
 
-from .accelerator import (
+from ml_framework.executor.accelerator import (
     Backend,
     HardwareProfile,
+    BackendUnavailableError,
     detect_hardware,
     select_backend,
-    LARGE_WORKLOAD_THRESHOLD,
 )
-from .config import Config
-from src.utils.logging import get_worker_logger
+from ml_framework.executor.config import Config
+from ml_framework.utils.logging import get_worker_logger
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +99,10 @@ def run_worker(task: WorkerTask) -> WorkerResult:
     """
     Execute a single ML training task inside a child process.
 
+    BackendUnavailableError (detection-layer) and DeviceUnavailableError
+    (runtime-layer) are both caught here and returned as a failed WorkerResult
+    so the pool continues processing remaining tasks.
+
     Parameters
     ----------
     task : WorkerTask
@@ -110,20 +117,19 @@ def run_worker(task: WorkerTask) -> WorkerResult:
     wall_start = time.perf_counter()
 
     try:
-        # Re-detect hardware inside the spawned process.
         profile: HardwareProfile = detect_hardware()
 
         n_samples, n_features = task.X.shape
+
+        # Pass large_workload_threshold from Config so the worker's threshold
+        # matches what the user configured, not the module-level default.
         backend: Backend = select_backend(
             profile=profile,
             n_samples=n_samples,
             n_features=n_features,
             force_backend=task.config.force_backend,
+            large_workload_threshold=task.config.large_workload_threshold,
         )
-
-        # Override large_workload_threshold from config.
-        import accelerator as _acc
-        _acc.LARGE_WORKLOAD_THRESHOLD = task.config.large_workload_threshold
 
         log.info(
             "[Task %s] backend=%s | shape=(%d, %d)",
@@ -134,9 +140,9 @@ def run_worker(task: WorkerTask) -> WorkerResult:
         )
 
         if task.model_type == "sklearn":
-            payload = _run_sklearn(task, backend, log)
+            payload = _run_sklearn(task, backend)
         elif task.model_type == "neural":
-            payload = _run_neural(task, backend, log)
+            payload = _run_neural(task, backend)
         else:
             raise ValueError(f"Unknown model_type: {task.model_type!r}")
 
@@ -149,6 +155,18 @@ def run_worker(task: WorkerTask) -> WorkerResult:
             backend_used=payload.get("backend_used", backend.name),
             duration_s=round(duration, 4),
             payload=payload,
+        )
+
+    except BackendUnavailableError as exc:
+        duration = time.perf_counter() - wall_start
+        msg = f"BackendUnavailableError: {exc}"
+        log.error("[Task %s] %s", task.task_id, msg)
+        return WorkerResult(
+            task_id=task.task_id,
+            success=False,
+            backend_used="UNAVAILABLE",
+            duration_s=round(duration, 4),
+            error=msg,
         )
 
     except Exception:
@@ -165,44 +183,27 @@ def run_worker(task: WorkerTask) -> WorkerResult:
 
 
 # ---------------------------------------------------------------------------
-# Internal dispatch helpers (not part of public API)
+# Internal dispatch helpers
 # ---------------------------------------------------------------------------
 
-def _run_sklearn(task: WorkerTask, backend: Backend, log: logging.Logger) -> dict:
-    from src.models.sklearn_models import fit_sklearn
-    result = fit_sklearn(
+def _run_sklearn(task: WorkerTask, backend: Backend) -> dict:
+    from ml_framework.models.sklearn_models import fit_sklearn
+    return fit_sklearn(
         estimator=task.estimator_or_model,
         X=task.X,
         y=task.y,
         backend=backend,
         sklearn_n_jobs=task.config.sklearn_n_jobs,
     )
-    return result
 
 
-def _run_neural(task: WorkerTask, backend: Backend, log: logging.Logger) -> dict:
-    from src.models.neural import train_neural
-
-    # Extract any optional training parameters passed via extra_kwargs
-    extra_kwargs = getattr(task, "extra_kwargs", {}) or {}
-    if extra_kwargs is None:
-        extra_kwargs = {}
-
-    result = train_neural(
+def _run_neural(task: WorkerTask, backend: Backend) -> dict:
+    from ml_framework.models.neural import train_neural
+    return train_neural(
         model=task.estimator_or_model,
         X=task.X,
         y=task.y,
         backend=backend,
-        **extra_kwargs
+        explicit_device=task.config.torch_device,
+        **(task.extra_kwargs or {}),
     )
-
-    # Translate the actual torch hardware target back into the reporting enum string
-    actual_device = str(result.get("device", "CPU")).lower()
-    if "cuda" in actual_device:
-        result["backend_used"] = Backend.NVIDIA_GPU.name
-    elif "xpu" in actual_device:
-        result["backend_used"] = Backend.INTEL_GPU.name
-    else:
-        result["backend_used"] = Backend.CPU.name
-
-    return result
