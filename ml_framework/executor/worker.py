@@ -1,18 +1,24 @@
 """
 executor/worker.py
 ------------------
-Worker function executed in each child process spawned by pool.py.
+Worker entry point executed in each spawned child process.
 
-Design constraints
-------------------
-- Must be importable on Windows (spawn requires top-level picklability).
+Changes from previous version
+------------------------------
+- WorkerTask.model_type (str) removed. Replaced by WorkerTask.model (MLModel).
+  Workers call task.model.run(...) directly — no string dispatch.
+- WorkerTask.X / .y replaced by WorkerTask.X_handle / .y_handle
+  (SharedArrayHandle). Arrays are reconstructed zero-copy inside the worker
+  via to_array(). No array data crosses the pickle pipe.
+- extra_kwargs removed — training hyperparameters now live inside the MLModel
+  subclass (e.g. NeuralModel.epochs, .batch_size, .lr).
+
+Design constraints (unchanged)
+-------------------------------
+- Importable on Windows (spawn picklability requirement).
 - No module-level side effects.
-- Receives WorkerTask; returns WorkerResult.
-- Backend selection re-runs inside the worker: child processes under 'spawn'
-  inherit no runtime state from the parent.
-- BackendUnavailableError from accelerator and DeviceUnavailableError from
-  neural.py are both caught and surfaced as a failed WorkerResult, not a
-  pool-level crash, so remaining tasks continue unaffected.
+- BackendUnavailableError and DeviceUnavailableError surface as failed
+  WorkerResult, not pool-level crash.
 """
 
 import os
@@ -22,8 +28,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-import numpy as np
-
 from ml_framework.executor.accelerator import (
     Backend,
     HardwareProfile,
@@ -32,6 +36,8 @@ from ml_framework.executor.accelerator import (
     select_backend,
 )
 from ml_framework.executor.config import Config
+from ml_framework.executor.shared_memory import SharedArrayHandle
+from ml_framework.models.base import MLModel
 from ml_framework.utils.logging import get_worker_logger
 
 
@@ -42,29 +48,26 @@ from ml_framework.utils.logging import get_worker_logger
 @dataclass
 class WorkerTask:
     """
-    Encapsulates all inputs a worker process needs.
+    Encapsulates all inputs a spawned worker needs.
 
     Attributes
     ----------
-    task_id : int or str
+    task_id : Any
         Unique identifier for logging and result correlation.
-    X : np.ndarray
-    y : np.ndarray
-    model_type : str
-        'sklearn' or 'neural'.
-    estimator_or_model : Any
-        Unfitted sklearn estimator OR nn.Module instance.
+    X_handle : SharedArrayHandle
+        Feature matrix, zero-copy shared memory descriptor.
+    y_handle : SharedArrayHandle
+        Target vector. May be a none-sentinel for unsupervised tasks.
+    model : MLModel
+        Carries the estimator/module and all training hyperparameters.
+        Dispatches itself via model.run().
     config : Config
-    extra_kwargs : dict
-        Forwarded verbatim to the model runner (e.g. epochs, batch_size).
     """
     task_id: Any
-    X: np.ndarray
-    y: np.ndarray
-    model_type: str
-    estimator_or_model: Any
+    X_handle: SharedArrayHandle
+    y_handle: SharedArrayHandle
+    model: MLModel
     config: Config
-    extra_kwargs: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -79,7 +82,7 @@ class WorkerResult:
     backend_used : str
     duration_s : float
     payload : dict
-        Model, history, or other artefacts from the runner.
+        Model, history, or other artefacts from MLModel.run().
     error : str or None
         Traceback string if success=False.
     """
@@ -99,10 +102,6 @@ def run_worker(task: WorkerTask) -> WorkerResult:
     """
     Execute a single ML training task inside a child process.
 
-    BackendUnavailableError (detection-layer) and DeviceUnavailableError
-    (runtime-layer) are both caught here and returned as a failed WorkerResult
-    so the pool continues processing remaining tasks.
-
     Parameters
     ----------
     task : WorkerTask
@@ -117,12 +116,14 @@ def run_worker(task: WorkerTask) -> WorkerResult:
     wall_start = time.perf_counter()
 
     try:
+        # Reconstruct arrays from shared memory — zero copy.
+        X = task.X_handle.to_array()
+        y = task.y_handle.to_array()
+
+        # Re-detect hardware inside the spawned process (spawn inherits no state).
         profile: HardwareProfile = detect_hardware()
 
-        n_samples, n_features = task.X.shape
-
-        # Pass large_workload_threshold from Config so the worker's threshold
-        # matches what the user configured, not the module-level default.
+        n_samples, n_features = X.shape
         backend: Backend = select_backend(
             profile=profile,
             n_samples=n_samples,
@@ -132,19 +133,15 @@ def run_worker(task: WorkerTask) -> WorkerResult:
         )
 
         log.info(
-            "[Task %s] backend=%s | shape=(%d, %d)",
+            "[Task %s] backend=%s | shape=(%d, %d) | model=%s",
             task.task_id,
             backend.name,
             n_samples,
             n_features,
+            type(task.model).__name__,
         )
 
-        if task.model_type == "sklearn":
-            payload = _run_sklearn(task, backend)
-        elif task.model_type == "neural":
-            payload = _run_neural(task, backend)
-        else:
-            raise ValueError(f"Unknown model_type: {task.model_type!r}")
+        payload = task.model.run(X, y, backend, task.config)
 
         duration = time.perf_counter() - wall_start
         log.info("[Task %s] Done in %.2fs", task.task_id, duration)
@@ -180,30 +177,3 @@ def run_worker(task: WorkerTask) -> WorkerResult:
             duration_s=round(duration, 4),
             error=tb,
         )
-
-
-# ---------------------------------------------------------------------------
-# Internal dispatch helpers
-# ---------------------------------------------------------------------------
-
-def _run_sklearn(task: WorkerTask, backend: Backend) -> dict:
-    from ml_framework.models.sklearn_models import fit_sklearn
-    return fit_sklearn(
-        estimator=task.estimator_or_model,
-        X=task.X,
-        y=task.y,
-        backend=backend,
-        sklearn_n_jobs=task.config.sklearn_n_jobs,
-    )
-
-
-def _run_neural(task: WorkerTask, backend: Backend) -> dict:
-    from ml_framework.models.neural import train_neural
-    return train_neural(
-        model=task.estimator_or_model,
-        X=task.X,
-        y=task.y,
-        backend=backend,
-        explicit_device=task.config.torch_device,
-        **(task.extra_kwargs or {}),
-    )
