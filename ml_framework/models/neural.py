@@ -1,22 +1,33 @@
 """
 models/neural.py
 ----------------
-PyTorch-based neural network training with automatic device dispatch.
+PyTorch neural network wrapper implementing the MLModel ABC.
 
 Device priority:
   NVIDIA_GPU -> 'cuda'
-  INTEL_GPU  -> 'xpu' (Intel Extension for PyTorch) or 'cpu' fallback
+  INTEL_GPU  -> 'xpu' (intel_extension_for_pytorch) or CPU fallback
   CPU        -> 'cpu'
 
-resolve_torch_device() raises DeviceUnavailableError when an explicitly
-requested accelerator cannot be satisfied, rather than silently falling
-back to CPU. Silent fallback masks misconfiguration and makes profiling
-results misleading.
+DeviceUnavailableError is raised (not swallowed) when NVIDIA_GPU is selected
+but CUDA is absent at training time — see resolve_torch_device().
 
-Dependencies
-------------
-  - torch (always required)
-  - intel_extension_for_pytorch (optional, Intel XPU support)
+Usage
+-----
+    from ml_framework.models.neural import NeuralModel, build_mlp_regressor
+
+    task = WorkerTask(
+        task_id="mlp",
+        X_handle=...,
+        y_handle=...,
+        model=NeuralModel(
+            build_mlp_regressor(input_dim=32),
+            epochs=50,
+            batch_size=256,
+            lr=1e-3,
+            task="regression",
+        ),
+        config=Config(),
+    )
 """
 
 import time
@@ -24,16 +35,18 @@ import logging
 from typing import Callable, Optional
 
 import numpy as np
+
 from ml_framework.executor.accelerator import Backend
+from ml_framework.executor.config import Config
+from ml_framework.models.base import MLModel
 
 logger = logging.getLogger(__name__)
 
 
 class DeviceUnavailableError(RuntimeError):
     """
-    Raised when the torch device required by a Backend cannot be acquired.
-    Distinct from BackendUnavailableError (accelerator-layer) so callers
-    can distinguish detection-time vs. runtime failures.
+    Raised when the torch device required by a Backend cannot be acquired at
+    training time. Distinct from BackendUnavailableError (detection-layer).
     """
 
 
@@ -53,12 +66,10 @@ def resolve_torch_device(
     ----------
     backend : Backend
     explicit_device : str or None
-        If set, returns torch.device(explicit_device) directly without
-        any availability check. Caller assumes full responsibility.
+        If set, returns torch.device(explicit_device) with no availability check.
     strict : bool
-        If True (default), raises DeviceUnavailableError when the backend
-        device cannot be acquired. If False, silently falls back to CPU.
-        Use strict=False only in testing or exploratory contexts.
+        True (default): raises DeviceUnavailableError if CUDA is requested but absent.
+        False: silently returns CPU. Use False only for testing.
 
     Returns
     -------
@@ -67,7 +78,6 @@ def resolve_torch_device(
     Raises
     ------
     DeviceUnavailableError
-        When strict=True and the requested backend device is unavailable.
     """
     import torch
 
@@ -78,10 +88,8 @@ def resolve_torch_device(
         if torch.cuda.is_available():
             return torch.device("cuda")
         msg = (
-            "Backend.NVIDIA_GPU was selected but torch.cuda.is_available() "
-            "returned False at training time. This indicates a mismatch between "
-            "hardware detection (accelerator.py) and the runtime CUDA context. "
-            "Check driver initialisation order and CUDA_VISIBLE_DEVICES."
+            "Backend.NVIDIA_GPU selected but torch.cuda.is_available() is False "
+            "at training time. Check CUDA_VISIBLE_DEVICES and driver state."
         )
         if strict:
             raise DeviceUnavailableError(msg)
@@ -95,12 +103,10 @@ def resolve_torch_device(
                 return torch.device("xpu")
         except ImportError:
             pass
-        # Intel XPU not available: this is a soft fallback (ipex is optional).
         logger.warning(
-            "Backend.INTEL_GPU requested for PyTorch but XPU is unavailable "
+            "Backend.INTEL_GPU for PyTorch: XPU unavailable "
             "(intel_extension_for_pytorch missing or no XPU device). "
-            "Falling back to CPU for this neural task. "
-            "sklearn tasks will still use sklearnex iGPU offload."
+            "Using CPU for this neural task."
         )
         return torch.device("cpu")
 
@@ -108,56 +114,83 @@ def resolve_torch_device(
 
 
 # ---------------------------------------------------------------------------
-# Generic MLP definitions
+# MLModel implementation
 # ---------------------------------------------------------------------------
 
-def _build_mlp(
-    input_dim: int,
-    output_dim: int,
-    hidden_dims: tuple[int, ...] = (256, 128, 64),
-    task: str = "regression",
-) -> "torch.nn.Module":
+class NeuralModel(MLModel):
     """
-    Build a fully-connected MLP with BatchNorm and ReLU activations.
+    Wraps an nn.Module and training hyperparameters for dispatch via WorkerTask.
 
     Parameters
     ----------
-    input_dim : int
-    output_dim : int
-    hidden_dims : tuple of int
-        Hidden layer widths.
+    module : torch.nn.Module
+        Unfitted model. Must be picklable.
     task : str
         'regression' or 'classification'.
-
-    Returns
-    -------
-    torch.nn.Sequential
+    epochs : int
+    batch_size : int
+    lr : float
+    loss_fn : callable or None
+        Custom loss. None = MSELoss (regression) or CrossEntropyLoss.
+    callbacks : list of callable or None
+        Each receives (epoch: int, avg_loss: float) after each epoch.
     """
-    import torch.nn as nn
 
-    layers: list[nn.Module] = []
-    prev = input_dim
-    for h in hidden_dims:
-        layers += [nn.Linear(prev, h), nn.BatchNorm1d(h), nn.ReLU()]
-        prev = h
+    def __init__(
+        self,
+        module: "torch.nn.Module",
+        task: str = "regression",
+        epochs: int = 50,
+        batch_size: int = 256,
+        lr: float = 1e-3,
+        loss_fn: Optional[Callable] = None,
+        callbacks: Optional[list[Callable]] = None,
+    ) -> None:
+        self.module = module
+        self.task = task
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.lr = lr
+        self.loss_fn = loss_fn
+        self.callbacks = callbacks or []
 
-    layers.append(nn.Linear(prev, output_dim))
+    def run(
+        self,
+        X: np.ndarray,
+        y: Optional[np.ndarray],
+        backend: Backend,
+        config: Config,
+    ) -> dict:
+        """
+        Train the module and return results dict.
 
-    if task == "classification" and output_dim == 1:
-        layers.append(nn.Sigmoid())
-    # Multi-class: softmax applied implicitly via CrossEntropyLoss.
-
-    return nn.Sequential(*layers)
+        Returns
+        -------
+        dict with keys: 'model', 'backend_used', 'device', 'history', 'duration_s'
+        """
+        return train_neural(
+            model=self.module,
+            X=X,
+            y=y,
+            backend=backend,
+            explicit_device=config.torch_device,
+            task=self.task,
+            epochs=self.epochs,
+            batch_size=self.batch_size,
+            lr=self.lr,
+            loss_fn=self.loss_fn,
+            callbacks=self.callbacks,
+        )
 
 
 # ---------------------------------------------------------------------------
-# Training loop
+# Core training loop (used by NeuralModel.run and callable directly)
 # ---------------------------------------------------------------------------
 
 def train_neural(
     model: "torch.nn.Module",
     X: np.ndarray,
-    y: np.ndarray,
+    y: Optional[np.ndarray],
     backend: Backend = Backend.CPU,
     explicit_device: Optional[str] = None,
     task: str = "regression",
@@ -173,39 +206,29 @@ def train_neural(
     Parameters
     ----------
     model : nn.Module
-        Unfitted PyTorch model instance.
     X : np.ndarray, shape (n_samples, n_features)
-    y : np.ndarray, shape (n_samples,) or (n_samples, n_outputs)
+    y : np.ndarray or None
     backend : Backend
     explicit_device : str or None
-        Passed directly to resolve_torch_device; bypasses all checks.
     task : str
-        'regression' or 'classification'. Determines default loss function.
     epochs : int
     batch_size : int
     lr : float
-        Learning rate for Adam.
     loss_fn : callable or None
-        Custom loss. Defaults to MSELoss (regression) or CrossEntropyLoss.
     callbacks : list of callable or None
-        Each callback receives (epoch: int, avg_loss: float).
 
     Returns
     -------
-    dict
-        Keys: 'model' (moved to CPU), 'device' (str), 'history' (list[float]),
-        'duration_s' (float), 'backend_used' (str).
+    dict: 'model' (on CPU), 'device', 'history', 'duration_s', 'backend_used'
 
     Raises
     ------
     DeviceUnavailableError
-        If backend=NVIDIA_GPU but CUDA is not available at runtime.
     """
     import torch
     import torch.nn as nn
     from torch.utils.data import TensorDataset, DataLoader
 
-    # strict=True: fail loudly if the selected backend cannot be honoured.
     device = resolve_torch_device(backend, explicit_device, strict=True)
     logger.info("Neural training on device: %s", str(device).upper())
 
@@ -218,11 +241,12 @@ def train_neural(
             y_t = y_t.unsqueeze(1)
 
     dataset = TensorDataset(X_t, y_t)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, pin_memory=False)
+    loader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=True, pin_memory=False
+    )
 
     model = model.to(device)
 
-    # Intel XPU: apply ipex optimisation pass when available.
     if str(device) == "xpu":
         try:
             import intel_extension_for_pytorch as ipex
@@ -258,9 +282,8 @@ def train_neural(
         if epoch % max(1, epochs // 10) == 0:
             logger.info("Epoch %d/%d | loss=%.6f", epoch, epochs, avg_loss)
 
-        if callbacks:
-            for cb in callbacks:
-                cb(epoch, avg_loss)
+        for cb in callbacks or []:
+            cb(epoch, avg_loss)
 
     duration = time.perf_counter() - start
     logger.info(
@@ -270,7 +293,6 @@ def train_neural(
         duration,
     )
 
-    # Resolve backend_used string from actual device, not from the Backend enum.
     actual = str(device).lower()
     if "cuda" in actual:
         backend_used = Backend.NVIDIA_GPU.name
@@ -291,6 +313,25 @@ def train_neural(
 # ---------------------------------------------------------------------------
 # Convenience constructors
 # ---------------------------------------------------------------------------
+
+def _build_mlp(
+    input_dim: int,
+    output_dim: int,
+    hidden_dims: tuple[int, ...],
+    task: str,
+) -> "torch.nn.Module":
+    import torch.nn as nn
+
+    layers = []
+    prev = input_dim
+    for h in hidden_dims:
+        layers += [nn.Linear(prev, h), nn.BatchNorm1d(h), nn.ReLU()]
+        prev = h
+    layers.append(nn.Linear(prev, output_dim))
+    if task == "classification" and output_dim == 1:
+        layers.append(nn.Sigmoid())
+    return nn.Sequential(*layers)
+
 
 def build_mlp_regressor(
     input_dim: int,
