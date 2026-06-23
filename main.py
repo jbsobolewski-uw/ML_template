@@ -1,7 +1,7 @@
 """
 main.py
 -------
-Demonstrates the updated ml_framework API:
+Demonstrates the ml_framework API:
   - run_parallel_simple() for minimal boilerplate (handles shm lifecycle).
   - SklearnModel / NeuralModel replacing model_type string.
   - SchedulingPolicy for GPU-aware ordering.
