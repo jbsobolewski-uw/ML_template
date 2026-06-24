@@ -6,38 +6,61 @@
 
 1. [Configuration](#1-configuration)
 2. [Backend selection](#2-backend-selection)
-3. [Building tasks](#3-building-tasks)
-4. [Running the pool](#4-running-the-pool)
-5. [Consuming results](#5-consuming-results)
-6. [Model export and inference](#6-model-export-and-inference)
-7. [Task decomposition — user responsibility](#7-task-decomposition--user-responsibility)
-8. [Memory management](#8-memory-management)
-9. [Error handling and pool behaviour](#9-error-handling-and-pool-behaviour)
-10. [Logging](#10-logging)
+3. [Building models](#3-building-models)
+4. [Building tasks](#4-building-tasks)
+5. [Running the pool](#5-running-the-pool)
+6. [Consuming results](#6-consuming-results)
+7. [Model export and inference](#7-model-export-and-inference)
+8. [Pool size and parallelism](#8-pool-size-and-parallelism)
+9. [Task decomposition — user responsibility](#9-task-decomposition--user-responsibility)
+10. [Memory management](#10-memory-management)
+11. [Error handling and pool behaviour](#11-error-handling-and-pool-behaviour)
+12. [Logging](#12-logging)
 
 ---
 
 ## 1. Configuration
 
-All tunable parameters are in `Config`. Pass one instance per call to `run_parallel`, or per `WorkerTask` for per-task overrides.
+All tunable parameters are in `Config`. A single instance can be passed to
+`run_parallel` as a pool-level default, or attached per `WorkerTask` for
+per-task overrides.
 
 ```python
 from ml_framework import Config, Backend
 
 Config(
-    pool_size=None,             # int or None. None = floor(cpu_count * 2/3), min 1
-    force_backend=None,         # Backend.CPU | Backend.INTEL_GPU | Backend.NVIDIA_GPU
-    large_workload_threshold=500_000,  # n_samples * n_features above which iGPU is bypassed
-    log_level="INFO",           # DEBUG | INFO | WARNING | ERROR
-    torch_device=None,          # str: 'cuda:0', 'cpu', 'xpu'. None = auto
-    sklearn_n_jobs=-1,          # passed to sklearn estimators on CPU path. -1 = all cores
-    extra={},                   # arbitrary kwargs forwarded to worker (user-defined use)
+    pool_size=None,
+    # int or None.
+    # None = number of physical CPU cores (detected via psutil, falls back
+    # to os.cpu_count() // 2). See section 8 for how to set this correctly.
+
+    force_backend=None,
+    # Backend.CPU | Backend.INTEL_GPU | Backend.NVIDIA_GPU
+    # If the requested backend is absent from hardware, raises
+    # BackendUnavailableError. Never silently falls back.
+
+    large_workload_threshold=500_000,
+    # n_samples * n_features above which iGPU is bypassed for sklearn tasks.
+    # iGPU memory bandwidth saturates on large dense matrices; CPU with
+    # n_jobs=-1 outperforms above this threshold.
+    # PyTorch tasks are not subject to this threshold.
+
+    log_level="INFO",
+    # "DEBUG" | "INFO" | "WARNING" | "ERROR"
+
+    torch_device=None,
+    # Explicit torch device string: "cuda:0", "xpu", "cpu".
+    # None = resolved automatically from backend selection.
+
+    sklearn_n_jobs=-1,
+    # Passed to sklearn estimators on the CPU path. -1 = all logical cores.
+    # Set to 1 if running many workers in parallel to avoid core contention.
+    # See section 8.
+
+    extra={},
+    # Arbitrary key-value pairs; not used by the framework internally.
 )
 ```
-
-`force_backend` raises `BackendUnavailableError` at task execution time if the requested hardware is absent. It does not fall back silently.
-
-`large_workload_threshold` applies only to Intel iGPU. Above this element count (`n_samples * n_features`) the framework routes sklearn tasks to CPU regardless of iGPU availability. This exists because iGPU memory bandwidth saturates on large dense matrices and CPU with `n_jobs=-1` outperforms. PyTorch tasks are not subject to this threshold; they follow CUDA > XPU > CPU priority unconditionally.
 
 ---
 
@@ -47,28 +70,36 @@ Config(
 
 | Condition | Selected backend |
 |---|---|
-| NVIDIA GPU + CUDA torch build | `NVIDIA_GPU` |
+| NVIDIA GPU present + CUDA torch build | `NVIDIA_GPU` |
 | Intel GPU + sklearnex + workload < threshold | `INTEL_GPU` |
 | Intel GPU + workload ≥ threshold | `CPU` |
-| No accelerator | `CPU` |
+| No accelerator available | `CPU` |
 
-NVIDIA takes priority over Intel unconditionally. If both are present and CUDA is available, `NVIDIA_GPU` is selected.
+NVIDIA takes priority over Intel unconditionally when both are present.
 
 ### PyTorch on Intel iGPU
 
-`INTEL_GPU` backend for neural tasks uses `intel-extension-for-pytorch` and routes to `xpu` device. If `intel-extension-for-pytorch` is not installed, the neural runner falls back to CPU with a warning. Sklearn tasks still use sklearnex iGPU offload regardless of ipex availability.
+`INTEL_GPU` for `NeuralModel` tasks requires `intel-extension-for-pytorch` and
+routes to the `xpu` device. If `intel-extension-for-pytorch` is not installed,
+PyTorch falls back to CPU with a WARNING log line. `SklearnModel` tasks still
+use sklearnex iGPU offload regardless of ipex availability.
 
 ### Forcing a backend
 
 ```python
 from ml_framework import Config, Backend
 
-# Raises BackendUnavailableError if CUDA is absent — never silently uses CPU.
 config = Config(force_backend=Backend.NVIDIA_GPU)
+# Raises BackendUnavailableError at task execution time if CUDA is absent.
 
-# Raises BackendUnavailableError if Intel GPU or sklearnex is absent.
 config = Config(force_backend=Backend.INTEL_GPU)
+# Raises BackendUnavailableError if Intel GPU or sklearnex is absent.
 ```
+
+When `force_backend` targets hardware with no registered slot (e.g. NVIDIA on a
+machine with no NVIDIA GPU), the scheduler downgrades the task to CPU before
+submission with a WARNING. `WorkerResult.requested_backend` records the original
+request; `WorkerResult.backend_used` records what actually ran. See section 6.
 
 ### Hardware detection
 
@@ -78,56 +109,60 @@ from ml_framework import detect_hardware
 profile = detect_hardware()
 print(profile.cuda_available)
 print(profile.intel_gpu_available)
-print(profile.extra)  # device names, cpu_count, platform
+print(profile.sklearnex_available)
+print(profile.torch_available)
+print(profile.extra)   # device names, cpu_count, platform string
 ```
 
-Detection runs in the calling process. Workers re-run detection independently because spawned processes do not inherit parent state.
+Detection runs in the calling process. Workers re-run detection independently
+because spawned processes do not inherit parent runtime state.
 
 ---
 
-## 3. Building tasks
+## 3. Building models
+
+Models are instances of `MLModel` subclasses. They carry the estimator or module
+and all training hyperparameters. The `model_type` string and `extra_kwargs` dict
+from older versions are removed.
+
+### SklearnModel
 
 ```python
-from ml_framework import WorkerTask, Config, build_mlp_regressor
-from sklearn.ensemble import GradientBoostingRegressor
+from ml_framework import SklearnModel
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.cluster import KMeans
 
-WorkerTask(
-    task_id="job_01",           # any hashable; used for logging and result lookup
-    X=X_train,                  # np.ndarray, shape (n_samples, n_features)
-    y=y_train,                  # np.ndarray
-    model_type="sklearn",       # "sklearn" | "neural"
-    estimator_or_model=GradientBoostingRegressor(n_estimators=200),
-    config=Config(),
-    extra_kwargs={},            # neural only: epochs, batch_size, lr, task, loss_fn, callbacks
-)
+model = SklearnModel(RandomForestRegressor(n_estimators=100, random_state=42))
+model = SklearnModel(GradientBoostingRegressor(n_estimators=200))
+model = SklearnModel(KMeans(n_clusters=10))
 ```
 
-For neural tasks `extra_kwargs` maps directly to `train_neural` keyword arguments:
+Any unfitted sklearn estimator that is picklable works. `n_jobs` is propagated
+from `Config.sklearn_n_jobs` automatically on the CPU path.
+
+### NeuralModel
 
 ```python
-WorkerTask(
-    task_id="mlp_01",
-    X=X, y=y,
-    model_type="neural",
-    estimator_or_model=build_mlp_regressor(input_dim=32),
-    config=Config(),
-    extra_kwargs={
-        "epochs": 100,
-        "batch_size": 512,
-        "lr": 5e-4,
-        "task": "regression",   # "regression" | "classification"
-        "loss_fn": None,        # nn.Module or None for default
-        "callbacks": [lambda epoch, loss: print(epoch, loss)],
-    },
+from ml_framework import NeuralModel, build_mlp_regressor, build_mlp_classifier
+
+model = NeuralModel(
+    build_mlp_regressor(input_dim=32, output_dim=1, hidden_dims=(256, 128, 64)),
+    task="regression",      # "regression" | "classification"
+    epochs=50,
+    batch_size=256,
+    lr=1e-3,
+    loss_fn=None,           # nn.Module or None — defaults to MSELoss / CrossEntropyLoss
+    callbacks=[],           # list of callable(epoch: int, avg_loss: float)
 )
 ```
 
 ### Custom architectures
 
-Pass any `nn.Module` instance as `estimator_or_model`. The training loop in `train_neural` is architecture-agnostic; it calls `.forward()` and backpropagates the loss.
+Pass any `nn.Module` to `NeuralModel`. The training loop is architecture-agnostic.
 
 ```python
 import torch.nn as nn
+from ml_framework import NeuralModel
 
 class ResBlock(nn.Module):
     def __init__(self, dim):
@@ -136,77 +171,208 @@ class ResBlock(nn.Module):
     def forward(self, x):
         return x + self.net(x)
 
-model = nn.Sequential(nn.Linear(32, 128), ResBlock(128), nn.Linear(128, 1))
+custom = nn.Sequential(nn.Linear(32, 128), ResBlock(128), nn.Linear(128, 1))
+model = NeuralModel(custom, epochs=50, batch_size=128)
+```
 
-task = WorkerTask(
-    task_id="resnet_tabular",
-    X=X, y=y,
-    model_type="neural",
-    estimator_or_model=model,
-    config=Config(),
-    extra_kwargs={"epochs": 50},
+The model instance must be picklable. Standard `nn.Module` subclasses are
+picklable by default. Avoid lambda layers or closures over unpicklable objects.
+
+### Custom MLModel subclass
+
+```python
+from ml_framework.models.base import MLModel
+from ml_framework import Backend, Config
+import numpy as np
+from typing import Optional
+
+class MyModel(MLModel):
+    def run(
+        self,
+        X: np.ndarray,
+        y: Optional[np.ndarray],
+        backend: Backend,
+        config: Config,
+    ) -> dict:
+        # ... fit logic ...
+        return {
+            "model": fitted_object,
+            "backend_used": backend.name,
+            "duration_s": 0.0,
+        }
+```
+
+The returned dict must contain at minimum `model`, `backend_used`, `duration_s`.
+
+---
+
+## 4. Building tasks
+
+### run_parallel_simple — recommended for most use cases
+
+Accepts raw `(task_id, X, y, model)` tuples. Handles shared memory allocation
+and cleanup internally. All tasks share the pool-level `Config`.
+
+```python
+from ml_framework import run_parallel_simple, Config, SchedulingPolicy
+
+results = run_parallel_simple(
+    [
+        ("rf",  X_train, y_train, SklearnModel(RandomForestRegressor())),
+        ("mlp", X_train, y_train, NeuralModel(build_mlp_regressor(32), epochs=30)),
+    ],
+    Config(pool_size=2),
+    policy=SchedulingPolicy.BIGGEST_FIRST,
 )
 ```
 
-The model instance must be picklable. Standard `nn.Module` subclasses are picklable by default. Lambda layers, closures capturing unpicklable objects, or models with open file handles are not.
+### make_task — for per-task Config overrides
 
----
-
-## 4. Running the pool
+Use when different tasks need different backends, thresholds, or log levels.
+Shared memory handles must be unlinked by the caller after results are collected.
 
 ```python
-from ml_framework import run_parallel, Config
+from ml_framework import make_task, run_parallel, Config, Backend
 
-results = run_parallel(tasks, config)
+tasks = []
+handles = []
+
+specs = [
+    ("task_a", X_small, y_small, SklearnModel(rf_small), Config()),
+    ("task_b", X_large, y_large, NeuralModel(mlp), Config(force_backend=Backend.NVIDIA_GPU)),
+]
+
+for task_id, X, y, model, cfg in specs:
+    task, task_handles = make_task(task_id, X, y, model, cfg)
+    tasks.append(task)
+    handles.extend(task_handles)
+
+try:
+    results = run_parallel(tasks, Config(pool_size=2))
+finally:
+    for h in handles:
+        h.unlink()
 ```
 
-`run_parallel` blocks until all tasks complete. It returns a list of `WorkerResult` in the same order as the input task list.
+### WorkerTask — direct construction
 
-Pool size is resolved as `min(n_tasks, config.pool_size or floor(cpu_count * 2/3))`. At most `pool_size` worker processes are alive simultaneously. Remaining tasks queue internally and are dispatched as workers finish.
+For full control, construct `WorkerTask` directly with pre-built
+`SharedArrayHandle` objects.
 
-The pool uses `multiprocessing.get_context("spawn")`, which is safe on both Linux and Windows. The spawn context requires:
+```python
+from ml_framework import WorkerTask, SharedArrayHandle, Config
+import numpy as np
 
-- The entrypoint must be protected by `if __name__ == "__main__":`.
-- All objects in `WorkerTask` (arrays, estimators, models, config) must be picklable.
-- The `ml_framework` package must be importable by child processes (i.e., on `PYTHONPATH`).
+X_handle = SharedArrayHandle.from_array(np.asarray(X))
+y_handle = SharedArrayHandle.from_array(np.asarray(y))
+
+task = WorkerTask(
+    task_id="manual",
+    X_handle=X_handle,
+    y_handle=y_handle,
+    model=SklearnModel(RandomForestRegressor()),
+    config=Config(),
+)
+
+# After run_parallel:
+X_handle.unlink()
+y_handle.unlink()
+```
+
+`SharedArrayHandle.from_array(None)` produces a none-sentinel for unsupervised
+tasks where `y` is not required.
 
 ---
 
-## 5. Consuming results
+## 5. Running the pool
+
+```python
+from ml_framework import run_parallel, Config, SchedulingPolicy
+
+results = run_parallel(tasks, config, policy=SchedulingPolicy.FIFO)
+```
+
+`run_parallel` blocks until all tasks complete and returns results in the same
+order as the input task list.
+
+### Scheduling policies
+
+| Policy | Behaviour |
+|---|---|
+| `FIFO` | Submission order. Default. Deterministic. |
+| `BIGGEST_FIRST` | Largest workload (n_samples × n_features) submitted first. Front-loads heavy tasks onto GPU while lighter tasks follow. |
+| `SMALLEST_FIRST` | Smallest workload first. Minimises queue wait time for light tasks. |
+
+Workload size is read from `SharedArrayHandle.shape` before any worker starts.
+
+### GPU slot behaviour
+
+One `threading.Lock` per GPU device slot is held in the scheduler. GPU tasks
+compete for their device slot via non-blocking `try_acquire`. A task that cannot
+acquire its slot is skipped — not downgraded — and retried after the next task
+completion frees the slot. CPU tasks and tasks targeting different slots proceed
+in the meantime.
+
+Tasks whose requested backend has no registered slot (hardware absent) are
+downgraded to CPU once at submission time with a WARNING. They do not block the
+queue.
+
+### Spawn requirements
+
+The pool uses `ProcessPoolExecutor` with the `spawn` start method on both platforms.
+
+- Entrypoint must be protected: `if __name__ == "__main__":`.
+- All objects in `WorkerTask` (model instances, config) must be picklable.
+- Array data is in shared memory and does not need to be picklable.
+- `ml_framework` must be importable by child processes.
+
+---
+
+## 6. Consuming results
 
 ```python
 for res in results:
-    res.task_id        # matches WorkerTask.task_id
-    res.success        # bool
-    res.backend_used   # "CPU" | "INTEL_GPU" | "NVIDIA_GPU" | "UNAVAILABLE" | "UNKNOWN"
-    res.duration_s     # wall time of the worker including hardware detection
-    res.payload        # dict — contents depend on model_type (see below)
-    res.error          # str traceback if success=False, else None
+    res.task_id           # matches task_id passed to make_task / run_parallel_simple
+    res.success           # bool
+    res.backend_used      # "CPU" | "INTEL_GPU" | "NVIDIA_GPU" | "UNAVAILABLE" | "UNKNOWN"
+    res.requested_backend # str or None — what Config.force_backend requested;
+                          # None means auto-selected.
+                          # Differs from backend_used when the scheduler downgraded
+                          # the task (e.g. "NVIDIA_GPU" requested, "CPU" used).
+    res.duration_s        # wall time inside the worker, including hardware detection
+    res.payload           # dict — contents depend on model type (see below)
+    res.error             # str traceback if success=False, else None
 ```
 
-### payload contents
+Detecting a downgrade:
 
-**sklearn tasks:**
+```python
+if res.requested_backend and res.requested_backend != res.backend_used:
+    print(f"Task {res.task_id} was downgraded: "
+          f"requested {res.requested_backend}, ran on {res.backend_used}")
+```
+
+### payload — SklearnModel tasks
 
 ```python
 res.payload["model"]        # fitted sklearn estimator
-res.payload["backend_used"] # str
+res.payload["backend_used"] # str — "CPU" or "INTEL_GPU"
 res.payload["duration_s"]   # float — fit time only, excludes detection overhead
 ```
 
-**neural tasks:**
+### payload — NeuralModel tasks
 
 ```python
-res.payload["model"]        # nn.Module on CPU
-res.payload["device"]       # str: "cuda", "xpu", "cpu"
+res.payload["model"]        # nn.Module moved to CPU
+res.payload["device"]       # str — "cuda", "xpu", or "cpu"
 res.payload["history"]      # list[float] — per-epoch average loss
 res.payload["duration_s"]   # float — training loop time only
-res.payload["backend_used"] # str — derived from actual torch device, not Backend enum
+res.payload["backend_used"] # str — derived from actual torch device used
 ```
 
 ---
 
-## 6. Model export and inference
+## 7. Model export and inference
 
 ### sklearn
 
@@ -215,15 +381,11 @@ import joblib
 
 model = res.payload["model"]
 
-# Persist
 joblib.dump(model, "model.joblib")
-
-# Reload
 model = joblib.load("model.joblib")
 
-# Inference
 preds = model.predict(X_test)
-scores = model.score(X_test, y_test)
+score = model.score(X_test, y_test)
 ```
 
 ### PyTorch
@@ -231,18 +393,14 @@ scores = model.score(X_test, y_test)
 ```python
 import torch
 
-model = res.payload["model"]  # already on CPU
+model = res.payload["model"]   # already on CPU
 
-# Persist weights only (requires architecture to reload)
+# Recommended: weights only (portable across moves/renames)
 torch.save(model.state_dict(), "model.pt")
-
-# Persist entire model (architecture + weights, less portable)
-torch.save(model, "model_full.pt")
-
-# Reload weights
 model.load_state_dict(torch.load("model.pt"))
 
-# Reload full model
+# Alternative: full model (less portable — pickles class path)
+torch.save(model, "model_full.pt")
 model = torch.load("model_full.pt")
 
 # Inference
@@ -251,176 +409,315 @@ with torch.no_grad():
     preds = model(torch.tensor(X_test, dtype=torch.float32))
 ```
 
-Prefer `state_dict` for portability. Full model serialisation with `torch.save(model)` pickles the class definition path; if the module is moved or renamed, reload fails.
+Prefer `state_dict` for anything that will be moved, renamed, or shared.
+Full model serialisation breaks if the module definition moves.
 
 ### Learning curve
 
 ```python
-history = res.payload["history"]  # list of avg loss per epoch
+history = res.payload["history"]   # list[float], one value per epoch
 import matplotlib.pyplot as plt
 plt.plot(history)
 plt.xlabel("epoch")
-plt.ylabel("loss")
+plt.ylabel("avg loss")
 ```
 
 ---
 
-## 7. Task decomposition — user responsibility
+## 8. Pool size and parallelism
 
-The framework does not decompose tasks internally. A single `WorkerTask` runs sequentially inside one worker process. There is no automatic chunking of large grid searches, hyperparameter sweeps, or dataset partitions.
+Understanding the two levels of parallelism is necessary to set `pool_size`
+correctly.
 
-**The user is responsible for task granularity.**
+### Two independent parallelism levels
 
-A `WorkerTask` is the atomic unit of parallelism. Concurrency is achieved only by submitting multiple tasks to `run_parallel`. The framework schedules them across the pool; it does not subdivide any individual task.
+**Level 1 — worker processes** (controlled by `Config.pool_size`):
+`pool_size` caps the number of worker processes alive simultaneously. Each
+process runs one task. This is the only level the framework controls.
 
-### Practical decomposition patterns
+**Level 2 — internal threading** (not controlled by the framework):
+Each worker process runs sklearn with `n_jobs=-1` (all logical cores) and
+PyTorch with its default thread pool (also all logical cores). This is
+internal to the library and independent of `pool_size`.
 
-**Grid search — explicit decomposition:**
+The GPU slot lock operates at level 1 only. It serialises access to a GPU
+device across worker processes. It has no effect on CPU parallelism — CPU
+tasks always submit immediately with no lock interaction.
+
+### Why `pool_size` and internal threading interact
+
+With `pool_size=2` and two CPU-bound workers both using all cores internally,
+both workers compete for the same physical cores simultaneously. You get ~full
+CPU utilisation but each task takes longer than if it ran alone. Adding more
+workers beyond 2 in this configuration increases contention without proportional
+throughput gain.
+
+### Recommended pool sizes by workload type
+
+**sklearn on Intel iGPU (`INTEL_GPU`)**
+The worker process is mostly waiting while the iGPU executes. CPU overhead per
+worker is low. Multiple workers can coexist without competing for CPU, but the
+GPU slot lock serialises actual iGPU use to one task at a time regardless.
+Recommended: `pool_size=2–4`. Extra workers handle CPU-side orchestration while
+one holds the iGPU slot.
+
+**NVIDIA GPU (PyTorch CUDA), 1 GPU**
+The GPU slot lock limits actual GPU execution to one task at a time. Additional
+workers either wait for the slot or run as CPU-downgraded tasks.
+Recommended: `pool_size=2` — one GPU task plus one CPU fallback task running
+concurrently. Higher values only help if you have many CPU-downgraded tasks.
+
+**NVIDIA GPU, N GPUs**
+N tasks can hold GPU slots simultaneously.
+Recommended: `pool_size=N` to `pool_size=N + n_physical_cores` depending on how
+many CPU tasks you also want running concurrently.
+
+**CPU with internal parallelism (`sklearn_n_jobs=-1`, PyTorch default threads)**
+Each worker saturates available cores internally. Workers compete directly.
+Recommended: `pool_size=1–2`. Beyond 2 increases context switching and slows
+individual tasks without meaningful throughput gain.
+
+**CPU with disabled internal parallelism (`sklearn_n_jobs=1`,
+`torch.set_num_threads(1)`)**
+Each worker uses one thread. No internal competition.
+Recommended: `pool_size=n_physical_cores`. Each worker maps cleanly to one core.
+This is the only scenario where the physical-core-based default of `pool_size=None`
+is genuinely optimal.
+
+### Summary table
+
+| Backend | Internal parallelism | Recommended pool_size |
+|---|---|---|
+| Intel iGPU (sklearn) | Low (GPU does the work) | 2–4 |
+| NVIDIA GPU (PyTorch) 1× | Low (GPU does the work) | 2 |
+| NVIDIA GPU (PyTorch) N× | Low | N to N + n_physical_cores |
+| CPU, `n_jobs=-1` / default threads | High | 1–2 |
+| CPU, `n_jobs=1` / `set_num_threads(1)` | None | n_physical_cores |
+| Mixed iGPU + CPU tasks | Mixed | 3–4 |
+
+### Controlling PyTorch thread count
+
+The framework does not currently cap PyTorch's internal thread pool. To run
+more workers in parallel without core competition, set the thread count manually
+at the start of `main.py` before spawning workers:
+
+```python
+import torch
+torch.set_num_threads(1)          # one thread per worker
+# then set pool_size=n_physical_cores in Config
+```
+
+---
+
+## 9. Task decomposition — user responsibility
+
+The framework does not decompose tasks internally. A single task runs sequentially
+inside one worker process. Concurrency comes only from submitting multiple tasks.
+
+### Grid search
 
 ```python
 from itertools import product
+from ml_framework import run_parallel_simple, Config, SklearnModel
 from sklearn.ensemble import RandomForestRegressor
 
 param_grid = {
     "n_estimators": [50, 100, 200],
-    "max_depth": [4, 8, 16],
+    "max_depth":    [4, 8, 16],
 }
 
-tasks = [
-    WorkerTask(
-        task_id=f"rf_ne{ne}_md{md}",
-        X=X, y=y,
-        model_type="sklearn",
-        estimator_or_model=RandomForestRegressor(
-            n_estimators=ne, max_depth=md, random_state=0
-        ),
-        config=Config(),
+specs = [
+    (
+        f"rf_ne{ne}_md{md}",
+        X, y,
+        SklearnModel(RandomForestRegressor(n_estimators=ne, max_depth=md, random_state=0)),
     )
     for ne, md in product(param_grid["n_estimators"], param_grid["max_depth"])
 ]
 
-results = run_parallel(tasks, Config(pool_size=4))
+results = run_parallel_simple(specs, Config(pool_size=2))
 ```
 
-**Image clustering — batched enumeration:**
+### Large enumeration — batched submission
 
-For 130 images × 20 k-values × 5 seeds = 13,000 combinations, creating all tasks upfront holds all 130 image arrays in parent-process memory simultaneously. Instead, batch by image:
+For enumerations over many large arrays (e.g. 130 images × 20 k-values × 5 seeds),
+constructing all tasks upfront holds all arrays resident in the parent process
+simultaneously. Batch by the outer dimension instead:
 
 ```python
-from ml_framework import run_parallel, Config, WorkerTask
+from ml_framework import run_parallel_simple, Config, SklearnModel
+from sklearn.cluster import KMeans
 
-def make_image_tasks(image, image_id, k_values, seeds):
-    tasks = []
-    for k in k_values:
-        for seed in seeds:
-            tasks.append(WorkerTask(
-                task_id=f"img{image_id}_k{k}_s{seed}",
-                X=image,
-                y=None,        # clustering — handle in a custom worker or adapt fit_sklearn
-                model_type="sklearn",
-                estimator_or_model=KMeans(n_clusters=k, random_state=seed),
-                config=Config(),
-            ))
-    return tasks
+config = Config(pool_size=2)
 
-config = Config(pool_size=4)
-
-for i, image in enumerate(load_images_lazily()):   # generator, not list
-    batch_tasks = make_image_tasks(image, i, k_values=[5,10,20], seeds=range(5))
-    batch_results = run_parallel(batch_tasks, config)
+for i, image in enumerate(load_images_lazily()):   # generator — one image at a time
+    specs = [
+        (
+            f"img{i}_k{k}_s{seed}",
+            image, None,
+            SklearnModel(KMeans(n_clusters=k, random_state=seed)),
+        )
+        for k in [5, 10, 20]
+        for seed in range(5)
+    ]
+    batch_results = run_parallel_simple(specs, config)
     process_results(batch_results)
-    # image array is released here before the next iteration
+    # image array released here before next iteration
 ```
 
-This keeps only one image resident in the parent at a time. `pool_size` worker processes each hold one task's copy of the image data; on task completion the worker's memory is freed before the next task is dispatched.
-
-**Key principle:** the pool size cap ensures at most `pool_size` tasks are executing simultaneously. Tasks not yet dispatched remain serialised in the pool's internal queue. However, `pool.map` requires the full task list to be constructed upfront and pickled into the queue. For large enumerations over large arrays, construct tasks in batches as above rather than building the full 13,000-task list at once.
-
----
-
-## 8. Memory management
-
-`run_parallel` calls `pool.map`, which pickles the entire task list into the worker queue before any task starts. For `N` tasks each containing an array of size `S`, parent-process peak memory is `N * S` before any result is returned.
-
-Mitigations:
-
-- Batch task submission as shown above.
-- Use memory-mapped arrays (`np.memmap`) for very large datasets. Workers receive the memmap path and load slices independently.
-- For neural tasks, `res.payload["model"]` is the full model on CPU. If running hundreds of tasks, hold only the state dict and discard the model object.
+`run_parallel_simple` allocates shared memory per batch and frees it after each
+call returns. Only `pool_size` workers are alive at once; remaining tasks in a
+batch queue internally and dispatch as workers finish.
 
 ---
 
-## 9. Error handling and pool behaviour
+## 10. Memory management
+
+### Shared memory
+
+Arrays are placed in `multiprocessing.shared_memory` blocks by the parent.
+Workers attach to the existing block — no array data crosses the pickle pipe.
+Each worker calls `.copy()` internally to get a writable local array, then
+detaches from the shared block. The parent unlinks blocks after the pool returns.
+
+Peak memory per array: shared block (1×) + one worker-local copy per active
+worker process. For an 80,000 × 128 float32 array (~40 MB):
+- Shared block: 40 MB
+- 2 active workers: 2 × 40 MB copies
+- Total: ~120 MB for that array
+
+### Shared memory on Windows
+
+On Windows, shared memory blocks persist until all processes that opened them
+release their handles and the creator calls `.unlink()`. A worker that exits
+abnormally before detaching leaves the block allocated until the parent's cleanup
+runs. Under heavy memory pressure, use `try/finally` around `run_parallel` when
+managing handles manually.
+
+### Large model results
+
+`res.payload["model"]` holds the full fitted model object in the parent process.
+For runs with many tasks, release models you no longer need or hold only the
+`state_dict`:
+
+```python
+state = res.payload["model"].state_dict()
+del res   # release the full result including the model object
+```
+
+---
+
+## 11. Error handling and pool behaviour
 
 ### Per-task failures
 
-A task that raises any exception inside the worker returns a `WorkerResult` with `success=False` and the full traceback in `res.error`. The pool continues processing remaining tasks.
+Exceptions inside a worker return a `WorkerResult` with `success=False` and
+the full traceback in `res.error`. The pool continues processing remaining tasks.
 
 ```python
 for res in results:
     if not res.success:
-        print(f"Task {res.task_id} failed:")
+        print(f"Task {res.task_id} failed ({res.backend_used}):")
         print(res.error)
 ```
 
-`res.backend_used` is `"UNAVAILABLE"` for `BackendUnavailableError` (forced backend absent from hardware) and `"UNKNOWN"` for all other exceptions.
+`res.backend_used` values on failure:
+
+| Value | Meaning |
+|---|---|
+| `"UNAVAILABLE"` | `BackendUnavailableError` — forced backend hardware absent |
+| `"UNKNOWN"` | Any other unhandled exception inside the worker |
 
 ### BackendUnavailableError
 
-Raised when `force_backend` is set in `Config` and the required hardware or libraries are absent. This surfaces as a failed `WorkerResult`, not a pool crash.
+Raised when `force_backend` is set and the required hardware or libraries are
+absent at worker startup. Caught by `run_worker` and returned as a failed result,
+not a pool crash.
 
-Conditions that trigger it:
-
-| Forced backend | Trigger condition |
+| Forced backend | Trigger |
 |---|---|
-| `Backend.NVIDIA_GPU` | `torch` not installed, or `torch.cuda.is_available()` is False |
+| `Backend.NVIDIA_GPU` | `torch` not installed, or `torch.cuda.is_available()` False |
 | `Backend.INTEL_GPU` | No Intel GPU detected, or `scikit-learn-intelex` not installed |
+
+### Scheduler downgrade vs BackendUnavailableError
+
+These are two distinct paths:
+
+- **Scheduler downgrade** (WARNING at scheduler layer, before worker starts):
+  triggered when `force_backend` targets a backend with no registered slot in
+  `ResourceRegistry` (e.g. NVIDIA_GPU on a machine with no NVIDIA GPU). The task
+  is submitted as CPU. `res.success=True`, `res.requested_backend` shows original
+  request, `res.backend_used="CPU"`.
+
+- **BackendUnavailableError** (ERROR inside worker): triggered when a slot exists
+  but `select_backend` raises because the hardware failed validation at detection
+  time inside the worker. `res.success=False`, `res.backend_used="UNAVAILABLE"`.
 
 ### DeviceUnavailableError
 
-Raised inside `neural.py` at training time if `Backend.NVIDIA_GPU` was selected by `select_backend` (passed hardware detection) but `torch.cuda.is_available()` returns False at the moment of training. This is a runtime divergence — CUDA was present at detection but absent at execution. Causes include driver reinitialisation, `CUDA_VISIBLE_DEVICES=""`, or context conflicts between spawned processes.
-
-Both error types are caught in `run_worker` and returned as failed `WorkerResult` objects.
+Raised inside `neural.py` if `Backend.NVIDIA_GPU` was selected by `select_backend`
+but `torch.cuda.is_available()` returns False at training time. This is a
+runtime divergence — CUDA was present at detection but absent at training.
+Causes: driver reinitialisation, `CUDA_VISIBLE_DEVICES=""`, or context conflicts
+between spawned processes.
 
 ### Pool-level crashes
 
-A pool-level crash (worker process killed by OOM, SIGKILL, or a C-extension segfault) is not recoverable per task. `pool.map` raises `WorkerLostError` in the parent, which propagates out of `run_parallel` as an unhandled exception. Wrap `run_parallel` in a try/except if this is a concern:
+A worker killed by OOM, SIGKILL, or a C-extension segfault causes
+`ProcessPoolExecutor` to raise in the parent, propagating out of `run_parallel`
+as an unhandled exception. Tasks in flight at crash time produce no result.
 
 ```python
-from multiprocessing import ProcessError
+from concurrent.futures import ProcessError
 
 try:
     results = run_parallel(tasks, config)
 except ProcessError as e:
-    # At least one worker was killed at the OS level.
-    print(e)
+    print(f"Worker killed at OS level: {e}")
 ```
 
-Tasks in flight at the time of the crash do not return results. Tasks not yet dispatched are lost. There is no automatic retry.
+There is no automatic retry.
 
-### Silent CPU fallback — what does and does not happen
+### Intel iGPU soft fallback for PyTorch
 
-The framework does not silently fall back from a requested accelerator to CPU at the backend-selection layer. `force_backend` either succeeds or raises.
-
-The one exception is Intel iGPU for PyTorch neural tasks: if `Backend.INTEL_GPU` is selected (or forced) but `intel-extension-for-pytorch` is absent, `resolve_torch_device` returns CPU with a warning rather than raising. This is intentional: ipex is an optional dependency, and sklearn tasks on the same worker still use sklearnex iGPU offload. The warning is logged at WARNING level and `res.payload["backend_used"]` will reflect `"CPU"`.
+If `Backend.INTEL_GPU` is selected for a `NeuralModel` task but
+`intel-extension-for-pytorch` is absent, `resolve_torch_device` returns CPU
+with a WARNING rather than raising. This is intentional: ipex is optional, and
+`SklearnModel` tasks on the same worker still use sklearnex iGPU offload.
+`res.backend_used` will be `"CPU"` and `res.payload["device"]` will be `"cpu"`.
 
 ---
 
-## 10. Logging
+## 12. Logging
 
 Call `setup_logging` once in the main process before `run_parallel`:
 
 ```python
 from ml_framework import setup_logging
-setup_logging("INFO")   # DEBUG | INFO | WARNING | ERROR
+setup_logging("INFO")   # "DEBUG" | "INFO" | "WARNING" | "ERROR"
 ```
 
-Worker processes configure their own handlers independently. The log level propagates via `Config.log_level` inside each `WorkerTask`. If different tasks require different verbosity, set `log_level` per `Config` instance.
+Worker processes configure their own handlers on startup. The log level
+propagates via `Config.log_level` per task. Different tasks can use different
+verbosity by attaching different `Config` instances.
 
-Log output format:
+Log format:
 
 ```
 [HH:MM:SS] [LEVEL] [ProcessName/module.name] message
 ```
 
-Worker process names are assigned by `multiprocessing.Pool` (`SpawnPoolWorker-1`, etc.) and appear in every log line, making it straightforward to trace which worker produced which output.
+Process names (`SpawnProcess-1`, `SpawnProcess-2`, etc.) appear in every line,
+making it straightforward to trace which worker produced which output and
+correlate with task timings.
+
+Key log lines to watch:
+
+| Source | Level | Meaning |
+|---|---|---|
+| `scheduler` | WARNING | Task downgraded — backend absent, running as CPU |
+| `scheduler` | DEBUG | GPU slot busy, task will retry after next completion |
+| `worker` | INFO | `backend=X \| requested=Y` — actual vs requested backend |
+| `accelerator` | INFO | `Workload exceeds threshold` — iGPU bypassed for large task |
+| `neural` | WARNING | XPU unavailable — PyTorch falling back to CPU |
+| `accelerator` | INFO | `Backend forced to: CPU` — downgraded task inside worker |
