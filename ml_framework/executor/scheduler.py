@@ -7,48 +7,56 @@ ordering policies.
 Problem
 -------
 pool.map dispatches tasks in FIFO order without regard for GPU contention.
-With N tasks targeting the same GPU and a pool_size > 1, multiple workers
-attempt simultaneous GPU use, causing CUDA context-switching overhead that
-can exceed the compute time itself for small/medium tasks.
+With N tasks targeting the same GPU, multiple workers attempt simultaneous
+GPU use, causing CUDA context-switching overhead that can dominate compute
+time on small/medium tasks.
 
 Solution
 --------
-A ResourceRegistry holds one threading.Lock per detected GPU device index.
-The scheduler dispatches tasks through a managed thread loop:
+ResourceRegistry holds one threading.Lock per detected GPU device index.
+The scheduler loop:
 
   1. Order the pending queue by SchedulingPolicy.
-  2. For the next task:
-     - If it targets a GPU backend: try-acquire the device lock.
-       - Lock acquired  → submit to ProcessPoolExecutor on the GPU-capable config.
-       - Lock not free  → downgrade task to CPU temporarily and submit immediately.
-         When the GPU lock becomes free, remaining GPU tasks will be submitted
-         without downgrade.
+  2. For each task that fits in an available executor slot:
+     - CPU tasks: submit immediately, no lock needed.
+     - GPU tasks: non-blocking try_acquire on the target device slot.
+         Acquired  → submit with GPU config, hold lock until task completes.
+         Not free  → leave task at front of pending queue; do not downgrade.
+                     Scheduler will retry on next iteration after a completion.
   3. On task completion, release the device lock (if held).
+
+This ensures GPU tasks are never silently demoted to CPU due to contention.
+They wait in the pending queue until the slot is genuinely free.
+
+Exception: if the registry has NO slot for the requested backend at all
+(e.g. force_backend=NVIDIA_GPU on a machine with no NVIDIA GPU), the task
+is flagged at submission time with a clear warning and submitted as CPU
+rather than looping forever.
 
 GPU slot count
 --------------
-By default, one slot per detected CUDA device is registered. Multi-GPU
-machines get one lock per device; tasks can target specific devices via
-Config.torch_device ('cuda:0', 'cuda:1', ...) or use the generic 'cuda'
-(binds to device 0 slot).
+One slot per detected CUDA device (by torch.cuda.device_count()).
+Intel iGPU: one shared slot at index -1.
+Multi-GPU: tasks with Config.torch_device='cuda:1' bind to slot 1, etc.
 
 Policies
 --------
-FIFO           - submission order (default, deterministic)
-BIGGEST_FIRST  - largest workload (n_samples * n_features) first;
-                 maximises GPU utilisation by front-loading heavy tasks.
-SMALLEST_FIRST - smallest workload first; minimises queue wait for light tasks.
+FIFO           - submission order (default)
+BIGGEST_FIRST  - largest workload first; front-loads heavy GPU tasks.
+SMALLEST_FIRST - smallest workload first; minimises latency for light tasks.
 
-Workload size is taken from SharedArrayHandle.shape when available, falling
-back to MLModel.workload_elements.
+Workload size derives from SharedArrayHandle.shape, falling back to
+MLModel.workload_elements.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import threading
 import time
-from concurrent.futures import ProcessPoolExecutor, Future, as_completed
+import traceback
+from concurrent.futures import ProcessPoolExecutor, Future
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Sequence, Optional
@@ -72,24 +80,21 @@ class SchedulingPolicy(Enum):
 
 @dataclass
 class _DeviceSlot:
-    """One GPU device slot: a lock + bookkeeping."""
+    """One GPU device slot: a mutex + identity."""
     device_index: int
     lock: threading.Lock = field(default_factory=threading.Lock)
-    current_task_id: Optional[object] = None
 
 
 class ResourceRegistry:
     """
     Tracks available GPU device slots.
 
-    One slot is registered per CUDA device detected. Intel GPU is treated as
-    a single shared slot (index -1) since sklearnex does not expose multi-GPU
-    addressing.
+    One slot per CUDA device; one shared slot (index -1) for Intel iGPU.
+    CPU tasks never interact with the registry.
 
     Parameters
     ----------
     profile : HardwareProfile
-        Result of detect_hardware() run in the parent process.
     """
 
     def __init__(self, profile: HardwareProfile) -> None:
@@ -103,31 +108,34 @@ class ResourceRegistry:
                 n = 1
             for i in range(max(n, 1)):
                 self._slots[i] = _DeviceSlot(device_index=i)
-            logger.debug("ResourceRegistry: registered %d CUDA slot(s).", n)
+            logger.debug("ResourceRegistry: %d CUDA slot(s) registered.", len(self._slots))
 
         if profile.intel_gpu_available:
-            # Intel iGPU treated as a single slot, index -1.
             self._slots[-1] = _DeviceSlot(device_index=-1)
-            logger.debug("ResourceRegistry: registered Intel GPU slot.")
+            logger.debug("ResourceRegistry: Intel GPU slot registered.")
+
+        if not self._slots:
+            logger.debug("ResourceRegistry: no GPU slots (CPU-only system).")
 
     @property
     def has_gpu_slots(self) -> bool:
         return bool(self._slots)
 
+    def has_slot_for(self, backend: Backend) -> bool:
+        """Return True if at least one slot exists for this backend type."""
+        if backend == Backend.NVIDIA_GPU:
+            return any(i >= 0 for i in self._slots)
+        if backend == Backend.INTEL_GPU:
+            return -1 in self._slots
+        return False  # CPU needs no slot
+
     def try_acquire(self, backend: Backend, torch_device: Optional[str]) -> Optional[int]:
         """
-        Non-blocking attempt to acquire a GPU slot matching backend/device.
+        Non-blocking acquisition of a matching slot.
 
-        Parameters
-        ----------
-        backend : Backend
-        torch_device : str or None
-            Explicit device string from Config (e.g. 'cuda:1').
-
-        Returns
-        -------
-        int or None
-            Device index if acquired, None if no slot is free.
+        Returns device index on success, None if all matching slots are busy.
+        Callers must first check has_slot_for(); this method assumes a slot
+        exists and returns None only when all are currently locked.
         """
         if backend == Backend.NVIDIA_GPU:
             target_idx = _parse_cuda_index(torch_device)
@@ -145,7 +153,7 @@ class ResourceRegistry:
                 return -1
             return None
 
-        return None  # CPU tasks do not use slots.
+        return None
 
     def release(self, slot_index: int) -> None:
         """Release a previously acquired slot."""
@@ -153,11 +161,11 @@ class ResourceRegistry:
             try:
                 self._slots[slot_index].lock.release()
             except RuntimeError:
-                pass  # already released
+                pass
 
 
 def _parse_cuda_index(device_str: Optional[str]) -> Optional[int]:
-    """Parse 'cuda:N' → N, 'cuda' → 0, None → None."""
+    """'cuda:N' -> N, 'cuda' -> 0, None -> None."""
     if device_str is None:
         return None
     if device_str.startswith("cuda:"):
@@ -175,10 +183,7 @@ def _parse_cuda_index(device_str: Optional[str]) -> Optional[int]:
 # ---------------------------------------------------------------------------
 
 def _workload_size(task: WorkerTask) -> int:
-    """
-    Estimate task workload in elements for scheduling purposes.
-    Uses SharedArrayHandle.shape if X_handle is present, else MLModel hint.
-    """
+    """Elements in X; used for BIGGEST/SMALLEST ordering."""
     if hasattr(task, "X_handle") and task.X_handle is not None:
         shape = task.X_handle.shape
         if len(shape) >= 2:
@@ -194,20 +199,41 @@ def _workload_size(task: WorkerTask) -> int:
 # Ordered queue
 # ---------------------------------------------------------------------------
 
-def _ordered_tasks(
-    tasks: list[WorkerTask],
-    policy: SchedulingPolicy,
-) -> list[WorkerTask]:
+def _ordered_tasks(tasks: list[WorkerTask], policy: SchedulingPolicy) -> list[WorkerTask]:
     if policy == SchedulingPolicy.BIGGEST_FIRST:
         return sorted(tasks, key=_workload_size, reverse=True)
     if policy == SchedulingPolicy.SMALLEST_FIRST:
         return sorted(tasks, key=_workload_size)
-    return list(tasks)  # FIFO
+    return list(tasks)
+
+
+# ---------------------------------------------------------------------------
+# Target backend inference
+# ---------------------------------------------------------------------------
+
+def _infer_target_backend(task: WorkerTask, profile: HardwareProfile) -> Backend:
+    """
+    Determine what backend a task will request, without running select_backend
+    (which requires X to be loaded). Mirrors auto-select priority.
+    """
+    if task.config.force_backend is not None:
+        return task.config.force_backend
+    if profile.cuda_available and profile.torch_available:
+        return Backend.NVIDIA_GPU
+    if profile.intel_gpu_available and profile.sklearnex_available:
+        workload = _workload_size(task)
+        if workload < task.config.large_workload_threshold:
+            return Backend.INTEL_GPU
+    return Backend.CPU
 
 
 # ---------------------------------------------------------------------------
 # Scheduler
 # ---------------------------------------------------------------------------
+
+# Sentinel: task should be held at front of pending queue (GPU slot busy).
+_HOLD = object()
+
 
 def run_scheduled(
     tasks: Sequence[WorkerTask],
@@ -216,18 +242,20 @@ def run_scheduled(
     policy: SchedulingPolicy = SchedulingPolicy.FIFO,
 ) -> list[WorkerResult]:
     """
-    Execute tasks via a GPU-aware scheduler.
+    Execute tasks via GPU-aware scheduler.
 
-    GPU tasks compete for per-device locks. A task that cannot immediately
-    acquire its target GPU device is submitted with a CPU-overridden config
-    so it does not stall the queue. GPU slots are released as tasks complete,
-    allowing subsequent GPU tasks to proceed without downgrade.
+    GPU tasks wait in the pending queue until their device slot is free.
+    They are never silently downgraded to CPU due to contention.
+    Tasks targeting a backend with no registered slot (e.g. NVIDIA_GPU on
+    a CPU-only or Intel-only machine) are logged as warnings and submitted
+    as CPU immediately rather than blocking indefinitely.
 
     Parameters
     ----------
     tasks : sequence of WorkerTask
     config : Config
-        Pool-level config. Per-task Config is preserved for backend selection.
+        Pool-level config (pool_size, log_level). Per-task Config on
+        task.config governs backend selection inside each worker.
     profile : HardwareProfile
     policy : SchedulingPolicy
 
@@ -235,55 +263,96 @@ def run_scheduled(
     -------
     list of WorkerResult, order matches input tasks.
     """
-    if not tasks:
+    # Materialise once — guards against generators and ensures id() stability.
+    tasks_list: list[WorkerTask] = list(tasks)
+    if not tasks_list:
         return []
 
     registry = ResourceRegistry(profile)
-    ordered = _ordered_tasks(list(tasks), policy)
 
-    # Map future → (original_task_index, acquired_slot_index_or_None)
+    # Build orig-index map before sorting so result order matches caller's list.
+    task_orig_idx: dict[int, int] = {id(t): i for i, t in enumerate(tasks_list)}
+    ordered = _ordered_tasks(tasks_list, policy)
+
+    # future -> (original_index, acquired_slot_or_None)
     future_meta: dict[Future, tuple[int, Optional[int]]] = {}
     results: dict[int, WorkerResult] = {}
 
-    # Index map: task_id → original position for result ordering.
-    task_index = {id(t): i for i, t in enumerate(tasks)}
-
-    max_workers = _resolve_pool_size(len(tasks), config.pool_size)
+    max_workers = _resolve_pool_size(len(tasks_list), config.pool_size)
     logger.info(
         "Scheduler starting | tasks=%d | workers=%d | policy=%s",
-        len(tasks),
-        max_workers,
-        policy.name,
+        len(tasks_list), max_workers, policy.name,
     )
 
     wall_start = time.perf_counter()
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        pending = list(ordered)
+        pending: list[WorkerTask] = list(ordered)
 
         while pending or future_meta:
-            # Submit as many tasks as executor slots allow.
-            while pending and len(future_meta) < max_workers:
-                task = pending.pop(0)
-                orig_idx = task_index[id(task)]
-                submit_task, slot = _prepare_submission(task, registry, profile)
-                fut = executor.submit(run_worker, submit_task)
-                future_meta[fut] = (orig_idx, slot)
-                logger.debug(
-                    "Submitted task %s | slot=%s | backend=%s",
-                    task.task_id,
-                    slot,
-                    submit_task.config.force_backend,
-                )
 
-            # Wait for at least one completion.
-            done_futures = []
-            for fut in list(future_meta.keys()):
-                if fut.done():
-                    done_futures.append(fut)
+            # --- submission pass -------------------------------------------
+            # Walk pending in order. Submit CPU tasks and GPU tasks that can
+            # acquire a slot. GPU tasks whose slot is busy are skipped (i += 1)
+            # so tasks further in the queue (CPU or different slot) can proceed.
+            # They are retried on the next iteration after a completion frees
+            # a slot. Tasks are never silently downgraded due to contention.
+            i = 0
+            while i < len(pending) and len(future_meta) < max_workers:
+                task = pending[i]
+                target = _infer_target_backend(task, profile)
+
+                if target == Backend.CPU:
+                    pending.pop(i)
+                    fut = executor.submit(run_worker, task)
+                    future_meta[fut] = (task_orig_idx[id(task)], None)
+                    continue  # don't increment i; next task slides into i
+
+                # GPU task: check whether any slot exists for this backend.
+                if not registry.has_slot_for(target):
+                    # Hardware absent or library missing for this backend.
+                    # Downgrade once with an explicit warning; never loop on it.
+                    logger.warning(
+                        "Task %s: %s requested but no slot registered "
+                        "(hardware absent or library missing). "
+                        "Submitting as CPU. requested_backend=%s actual_backend=CPU",
+                        task.task_id, target.name, target.name,
+                    )
+                    pending.pop(i)
+                    cpu_task = dataclasses.replace(
+                        task,
+                        config=dataclasses.replace(
+                            task.config, force_backend=Backend.CPU
+                        ),
+                    )
+                    fut = executor.submit(run_worker, cpu_task)
+                    # Use id(task) — the original object still in task_orig_idx.
+                    future_meta[fut] = (task_orig_idx[id(task)], None)
+                    continue
+
+                slot = registry.try_acquire(target, task.config.torch_device)
+                if slot is not None:
+                    pending.pop(i)
+                    fut = executor.submit(run_worker, task)
+                    future_meta[fut] = (task_orig_idx[id(task)], slot)
+                    logger.debug(
+                        "Task %s acquired slot %d for %s.",
+                        task.task_id, slot, target.name,
+                    )
+                    continue
+
+                # Slot exists but currently locked. Skip — do not downgrade.
+                # Other tasks (CPU or targeting a free slot) may still proceed.
+                logger.debug(
+                    "Task %s: slot for %s busy, will retry after next completion.",
+                    task.task_id, target.name,
+                )
+                i += 1
+
+            # --- wait for completion ---------------------------------------
+            done_futures = [f for f in future_meta if f.done()]
 
             if not done_futures:
-                # Brief sleep to avoid busy-wait; tune as needed.
                 time.sleep(0.05)
                 continue
 
@@ -291,73 +360,27 @@ def run_scheduled(
                 orig_idx, slot = future_meta.pop(fut)
                 if slot is not None:
                     registry.release(slot)
+                    logger.debug("Released slot %d.", slot)
                 try:
                     result = fut.result()
-                except Exception as exc:
-                    import traceback
+                except Exception:
                     result = WorkerResult(
-                        task_id=ordered[orig_idx].task_id,
+                        task_id="unknown",
                         success=False,
                         backend_used="UNKNOWN",
                         duration_s=0.0,
                         error=traceback.format_exc(),
                     )
                 results[orig_idx] = result
-                logger.debug("Completed task | orig_idx=%d | success=%s", orig_idx, result.success)
 
     wall_duration = time.perf_counter() - wall_start
     successes = sum(1 for r in results.values() if r.success)
     logger.info(
         "Scheduler complete | %d/%d succeeded | wall_time=%.2fs",
-        successes, len(tasks), wall_duration,
+        successes, len(tasks_list), wall_duration,
     )
 
-    return [results[i] for i in range(len(tasks))]
-
-
-def _prepare_submission(
-    task: WorkerTask,
-    registry: ResourceRegistry,
-    profile: HardwareProfile,
-) -> tuple[WorkerTask, Optional[int]]:
-    """
-    Attempt to acquire a GPU slot for task. If unavailable, override config
-    to CPU so the task runs immediately without stalling.
-
-    Returns
-    -------
-    (task_to_submit, acquired_slot_or_None)
-    """
-    import dataclasses
-
-    # Determine what backend this task would target.
-    target_backend = task.config.force_backend
-    if target_backend is None:
-        # Infer from profile (mirrors select_backend logic without running it).
-        if profile.cuda_available and profile.torch_available:
-            target_backend = Backend.NVIDIA_GPU
-        elif profile.intel_gpu_available and profile.sklearnex_available:
-            target_backend = Backend.INTEL_GPU
-        else:
-            target_backend = Backend.CPU
-
-    if target_backend == Backend.CPU:
-        return task, None
-
-    slot = registry.try_acquire(target_backend, task.config.torch_device)
-
-    if slot is not None:
-        # GPU slot acquired — submit as-is.
-        return task, slot
-
-    # GPU busy — temporarily downgrade to CPU.
-    logger.info(
-        "Task %s: GPU slot busy, downgrading to CPU for this submission.",
-        task.task_id,
-    )
-    cpu_config = dataclasses.replace(task.config, force_backend=Backend.CPU)
-    cpu_task = dataclasses.replace(task, config=cpu_config)
-    return cpu_task, None
+    return [results[i] for i in range(len(tasks_list))]
 
 
 def _resolve_pool_size(n_tasks: int, requested: Optional[int]) -> int:

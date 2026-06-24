@@ -1,7 +1,7 @@
 """
 main.py
 -------
-Demonstrates the ml_framework API:
+Demonstrates the updated ml_framework API:
   - run_parallel_simple() for minimal boilerplate (handles shm lifecycle).
   - SklearnModel / NeuralModel replacing model_type string.
   - SchedulingPolicy for GPU-aware ordering.
@@ -152,12 +152,15 @@ def _print_summary(results) -> None:
         status = "SUCCESS" if res.success else "FAILED"
         print(f"Task [{res.task_id}] -> {status}")
         if res.success:
-            print(f"  Backend : {res.backend_used}")
-            print(f"  Duration: {res.duration_s}s")
+            requested = res.requested_backend or "auto"
+            match = "" if res.requested_backend is None or res.requested_backend == res.backend_used else " (DOWNGRADED)"
+            print(f"  Requested : {requested}{match}")
+            print(f"  Backend   : {res.backend_used}")
+            print(f"  Duration  : {res.duration_s}s")
             if "model" in res.payload:
-                print(f"  Model   : {type(res.payload['model']).__name__}")
+                print(f"  Model     : {type(res.payload['model']).__name__}")
         else:
-            print(f"  Error   : {res.error}")
+            print(f"  Error     : {res.error}")
         print("-" * 55)
 
 

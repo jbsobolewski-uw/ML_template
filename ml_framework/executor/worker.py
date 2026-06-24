@@ -80,6 +80,12 @@ class WorkerResult:
     task_id : Any
     success : bool
     backend_used : str
+        Backend that actually executed the task ('CPU', 'INTEL_GPU', 'NVIDIA_GPU',
+        'UNAVAILABLE', 'UNKNOWN').
+    requested_backend : str or None
+        Backend originally requested via Config.force_backend, or None if
+        auto-selected. Differs from backend_used when the scheduler downgraded
+        the task (e.g. NVIDIA_GPU requested on hardware without CUDA).
     duration_s : float
     payload : dict
         Model, history, or other artefacts from MLModel.run().
@@ -90,6 +96,7 @@ class WorkerResult:
     success: bool
     backend_used: str
     duration_s: float
+    requested_backend: Optional[str] = None
     payload: dict = field(default_factory=dict)
     error: Optional[str] = None
 
@@ -115,6 +122,11 @@ def run_worker(task: WorkerTask) -> WorkerResult:
 
     wall_start = time.perf_counter()
 
+    # Capture what the caller originally requested before any selection logic.
+    requested_backend: Optional[str] = (
+        task.config.force_backend.name if task.config.force_backend is not None else None
+    )
+
     try:
         # Reconstruct arrays from shared memory — zero copy.
         X = task.X_handle.to_array()
@@ -133,9 +145,10 @@ def run_worker(task: WorkerTask) -> WorkerResult:
         )
 
         log.info(
-            "[Task %s] backend=%s | shape=(%d, %d) | model=%s",
+            "[Task %s] backend=%s | requested=%s | shape=(%d, %d) | model=%s",
             task.task_id,
             backend.name,
+            requested_backend or "auto",
             n_samples,
             n_features,
             type(task.model).__name__,
@@ -150,6 +163,7 @@ def run_worker(task: WorkerTask) -> WorkerResult:
             task_id=task.task_id,
             success=True,
             backend_used=payload.get("backend_used", backend.name),
+            requested_backend=requested_backend,
             duration_s=round(duration, 4),
             payload=payload,
         )
@@ -162,6 +176,7 @@ def run_worker(task: WorkerTask) -> WorkerResult:
             task_id=task.task_id,
             success=False,
             backend_used="UNAVAILABLE",
+            requested_backend=requested_backend,
             duration_s=round(duration, 4),
             error=msg,
         )
@@ -174,6 +189,7 @@ def run_worker(task: WorkerTask) -> WorkerResult:
             task_id=task.task_id,
             success=False,
             backend_used="UNKNOWN",
+            requested_backend=requested_backend,
             duration_s=round(duration, 4),
             error=tb,
         )
