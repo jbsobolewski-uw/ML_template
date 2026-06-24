@@ -274,8 +274,11 @@ def run_scheduled(
     task_orig_idx: dict[int, int] = {id(t): i for i, t in enumerate(tasks_list)}
     ordered = _ordered_tasks(tasks_list, policy)
 
-    # future -> (original_index, acquired_slot_or_None)
-    future_meta: dict[Future, tuple[int, Optional[int]]] = {}
+    # future -> (original_index, acquired_slot_or_None, original_requested_backend_or_None)
+    # The third element preserves the backend the user asked for on tasks that were
+    # downgraded before submission (force_backend replaced with CPU). Without it,
+    # run_worker sees only the overridden config and reports requested=CPU.
+    future_meta: dict[Future, tuple[int, Optional[int], Optional[str]]] = {}
     results: dict[int, WorkerResult] = {}
 
     max_workers = _resolve_pool_size(len(tasks_list), config.pool_size)
@@ -305,7 +308,7 @@ def run_scheduled(
                 if target == Backend.CPU:
                     pending.pop(i)
                     fut = executor.submit(run_worker, task)
-                    future_meta[fut] = (task_orig_idx[id(task)], None)
+                    future_meta[fut] = (task_orig_idx[id(task)], None, None)
                     continue  # don't increment i; next task slides into i
 
                 # GPU task: check whether any slot exists for this backend.
@@ -326,15 +329,16 @@ def run_scheduled(
                         ),
                     )
                     fut = executor.submit(run_worker, cpu_task)
-                    # Use id(task) — the original object still in task_orig_idx.
-                    future_meta[fut] = (task_orig_idx[id(task)], None)
+                    # Preserve the original target so WorkerResult.requested_backend
+                    # reflects what the user asked for, not the downgraded config.
+                    future_meta[fut] = (task_orig_idx[id(task)], None, target.name)
                     continue
 
                 slot = registry.try_acquire(target, task.config.torch_device)
                 if slot is not None:
                     pending.pop(i)
                     fut = executor.submit(run_worker, task)
-                    future_meta[fut] = (task_orig_idx[id(task)], slot)
+                    future_meta[fut] = (task_orig_idx[id(task)], slot, None)
                     logger.debug(
                         "Task %s acquired slot %d for %s.",
                         task.task_id, slot, target.name,
@@ -357,12 +361,19 @@ def run_scheduled(
                 continue
 
             for fut in done_futures:
-                orig_idx, slot = future_meta.pop(fut)
+                orig_idx, slot, scheduler_requested = future_meta.pop(fut)
                 if slot is not None:
                     registry.release(slot)
                     logger.debug("Released slot %d.", slot)
                 try:
                     result = fut.result()
+                    # If the scheduler downgraded this task, the worker only saw
+                    # the overridden config (force_backend=CPU). Restore the true
+                    # requested backend so the caller sees what was originally asked.
+                    if scheduler_requested is not None:
+                        result = dataclasses.replace(
+                            result, requested_backend=scheduler_requested
+                        )
                 except Exception:
                     result = WorkerResult(
                         task_id="unknown",
